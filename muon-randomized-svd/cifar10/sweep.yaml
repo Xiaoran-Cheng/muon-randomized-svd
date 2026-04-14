@@ -12,7 +12,7 @@ parameters:
       - quintic_ns_empirical
       - polar_express
   rank:
-    values: [4, 8, 16, 32]
+    values: [16, 32, 64, 128, 256]
   orth_steps:
     values: [1, 3, 5, 7, 9]
   batch_size:
@@ -23,7 +23,7 @@ parameters:
     max: 1.0
   muon_momentum:
     distribution: uniform
-    min: 0.3
+    min: 0.5
     max: 0.95
 command:
   - ${env}
