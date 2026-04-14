@@ -64,7 +64,7 @@ command:
   - "0.24"
   - --filter-adamw-weight-decay
   - "0.0"
-  # --- Randomized solver ----
+  # --- Randomized solver ---
   - --randomized
   - "True"
   - --oversampling
