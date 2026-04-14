@@ -1,0 +1,69 @@
+# E4: Batch-Size Sweep
+# Fix: solver from E1, rank from E2, orth_steps from E3, oversampling=10, power_iters=1
+# Update inexact_solver, rank, orth-steps below to the winners from E1-E3
+program: airbench94_muon.py
+method: grid
+metric:
+  name: final_val_acc
+  goal: maximize
+parameters:
+  batch_size:
+    values: [500, 1000, 2000, 3000, 4000]
+command:
+  - ${env}
+  - python
+  - ${program}
+  # --- General ---
+  - --optimizer-mode
+  - muon
+  - --epochs
+  - "8"
+  - --num-trials
+  - "1"
+  - --val-every-steps
+  - "100"
+  - --wandb
+  - "True"
+  # --- SGD (for non-filter params) ---
+  - --sgd-momentum
+  - "0.85"
+  - --sgd-nesterov
+  - "True"
+  # --- Muon ---
+  - --muon-lr
+  - "0.24"
+  - --muon-momentum
+  - "0.6"
+  - --muon-nesterov
+  - "True"
+  # --- SGD filter (unused in muon mode) ---
+  - --filter-sgd-lr
+  - "0.24"
+  - --filter-sgd-weight-decay
+  - "0.0"
+  # --- AdamW (unused in muon mode) ---
+  - --adamw-beta1
+  - "0.9"
+  - --adamw-beta2
+  - "0.999"
+  - --adamw-eps
+  - "1e-8"
+  - --filter-adamw-lr
+  - "0.24"
+  - --filter-adamw-weight-decay
+  - "0.0"
+  # --- Randomized solver ---
+  - --randomized
+  - "True"
+  - --inexact_solver
+  - quintic_ns_empirical
+  - --rank
+  - "8"
+  - --oversampling
+  - "10"
+  - --power-iters
+  - "1"
+  - --orth-steps
+  - "5"
+  # --- Swept by ${args}: batch_size ---
+  - ${args}
