@@ -159,16 +159,17 @@ def randomized_project(M, rank=32, oversampling=2, power_iters=0):
     m, n = M.shape
     ell = rank + oversampling
 
-    Omega = torch.randn(n, ell, device=M.device, dtype=M.dtype)
-
-    Y = M @ Omega
+    # Sketch + power iteration in fp32 to avoid fp16 overflow
+    # (sigma_max(M) cubed under power_iters>=1 routinely exceeds 65504 in fp16).
+    M_f32 = M.float()
+    Omega = torch.randn(n, ell, device=M.device, dtype=torch.float32)
+    Y = M_f32 @ Omega
     for _ in range(power_iters):
-        Y = M @ (M.T @ Y)
+        Y = M_f32 @ (M_f32.T @ Y)
 
-    # geqrf_cuda has no fp16 kernel; do QR in float32 then cast back
-    Q_f32, _ = torch.linalg.qr(Y.float())
+    Q_f32, _ = torch.linalg.qr(Y)
     Q = Q_f32.to(M.dtype)
-    B = Q.T @ M
+    B = (Q_f32.T @ M_f32).to(M.dtype)
     return Q, B
 
 INEXACT_SOLVERS = (
