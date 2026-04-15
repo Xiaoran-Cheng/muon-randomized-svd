@@ -1012,6 +1012,20 @@ if __name__ == "__main__":
         default=False,
         help="Enable Weights & Biases logging (True/False).",
     )
+    parser.add_argument(
+        "--wandb-project", "--wandb_project",
+        dest="wandb_project",
+        type=str,
+        default="cifar10-muon",
+        help="W&B project name (ignored inside a sweep agent; sweep's project wins).",
+    )
+    parser.add_argument(
+        "--wandb-group", "--wandb_group",
+        dest="wandb_group",
+        type=str,
+        default=None,
+        help="W&B group name; defaults to output_dir basename when unset.",
+    )
     args = parser.parse_args()
     if args.num_trials <= 0:
         raise ValueError(f"--num-trials must be positive, got {args.num_trials}")
@@ -1092,9 +1106,9 @@ if __name__ == "__main__":
     for run in range(args.num_trials):
         if use_wandb:
             wandb.init(
-                project="cifar10-muon",
+                project=args.wandb_project,
                 config=vars(args),
-                group=os.path.basename(output_dir)[:128],
+                group=(args.wandb_group or os.path.basename(output_dir))[:128],
                 name=f"trial_{run:03d}",
                 reinit=True,
             )

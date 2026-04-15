@@ -10,6 +10,8 @@ python airbench94_muon.py \
   --num-trials 50 \
   --val-every-steps 10 \
   --wandb True \
+  --wandb-project MuonNesterov_best \
+  --wandb-group best_$(date +%Y%m%d_%H%M%S) \
   --batch-size 1000 \
   --sgd-momentum 0.85 \
   --sgd-nesterov True \
