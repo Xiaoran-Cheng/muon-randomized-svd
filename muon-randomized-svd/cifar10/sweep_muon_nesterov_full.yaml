@@ -1,34 +1,30 @@
-# Bayesian sweep over all key hyperparameters (Muon Nesterov, randomized NS) — main method
+# Muon (Nesterov momentum, full Newton-Schulz) sweep
 program: airbench94_muon.py
 entity: xjc5161-penn-state
-project: muon-nesterov-rand
+project: muon-nesterov-full
 method: bayes
 metric:
   name: final_val_acc
   goal: maximize
 parameters:
+  muon_lr:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 1.0
+  muon_momentum:
+    distribution: uniform
+    min: 0.3
+    max: 0.95
   inexact_solver:
     values:
       - cubic_ns_theoretical
       - quintic_ns_theoretical
       - quintic_ns_empirical
       - polar_express
-  rank:
-    values: [16, 32, 64, 128, 256]
   orth_steps:
     values: [1, 3, 5, 7, 9]
   batch_size:
     values: [500, 1000, 2000, 3000, 4000]
-  muon_lr:          # 下一次固定
-    distribution: log_uniform_values
-    min: 0.01
-    max: 1.0
-  muon_momentum:   # 下一次固定
-    distribution: uniform
-    min: 0.3
-    max: 0.95
-  power_iters:
-    values: [0, 1, 2, 3, 4, 5]
 command:
   - ${env}
   - python
@@ -45,13 +41,13 @@ command:
   - --wandb
   - "True"
   - --wandb-project
-  - muon-nesterov-rand
+  - muon-nesterov-full
   # --- SGD (for non-filter params) ---
   - --sgd-momentum
   - "0.85"
   - --sgd-nesterov
   - "True"
-  # --- Muon ---
+  # --- Muon (Nesterov: muon-nesterov=True) ---
   - --muon-nesterov
   - "True"
   # --- SGD filter (unused in muon mode) ---
@@ -70,10 +66,14 @@ command:
   - "0.24"
   - --filter-adamw-weight-decay
   - "0.0"
-  # --- Randomized solver ---
+  # --- Solver: full NS (randomized=False) ---
   - --randomized
-  - "True"
+  - "False"
+  - --rank
+  - "32"
   - --oversampling
   - "10"
-  # --- Swept by ${args}: inexact_solver, rank, orth_steps, batch_size, muon_lr, muon_momentum, power_iters ---
+  - --power-iters
+  - "0"
+  # --- Swept by ${args}: muon_lr, muon_momentum, inexact_solver, orth_steps, batch_size ---
   - ${args}

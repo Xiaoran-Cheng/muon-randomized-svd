@@ -564,7 +564,8 @@ def build_output_dir_from_args(args):
         abbr = ARG_ABBREVIATIONS.get(key, key)
         parts.append(f"{abbr}{_format_arg_value(arg_items[key])}")
     folder_name = "_".join(parts)
-    output_dir = os.path.join("logs", folder_name)
+    variant_subdir = getattr(args, "wandb_project", None) or "default"
+    output_dir = os.path.join("logs", variant_subdir, folder_name)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -1103,6 +1104,9 @@ if __name__ == "__main__":
         use_wandb=False,
     )
     trial_outputs = []
+    wandb_parent_dir = os.path.dirname(output_dir)
+    if use_wandb:
+        os.makedirs(wandb_parent_dir, exist_ok=True)
     for run in range(args.num_trials):
         if use_wandb:
             wandb.init(
@@ -1111,6 +1115,7 @@ if __name__ == "__main__":
                 group=(args.wandb_group or os.path.basename(output_dir))[:128],
                 name=f"trial_{run:03d}",
                 reinit=True,
+                dir=wandb_parent_dir,
             )
         trial_result = main(
             run,

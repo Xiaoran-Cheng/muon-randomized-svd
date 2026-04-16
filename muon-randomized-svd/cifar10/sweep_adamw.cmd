@@ -2,12 +2,11 @@ universe   = vanilla
 getenv     = true
 executable = sweep.sh
 
-# Usage: first create the sweep on the login node:
-#   wandb sweep sweep.yaml          # creates sweep under project muon-nesterov-rand
-# then paste the new sweep ID below and submit:
-#   condor_submit sweep.cmd
-# (Old completed sweep: xjc5161-penn-state/uncategorized/nnn9t5sv — kept for reference)
-arguments  = xjc5161-penn-state/muon-nesterov-rand/<SWEEP_ID> 100
+# Usage:
+#   wandb sweep sweep_adamw.yaml       # creates sweep, prints SWEEP_ID
+#   replace <SWEEP_ID> below with the printed ID
+#   condor_submit sweep_adamw.cmd
+arguments  = xjc5161-penn-state/adamw/0ey6mkqh 100
 
 log    = /home/xcheng328/cifar10/$(Cluster).$(Process).log
 output = /home/xcheng328/cifar10/$(Cluster).$(Process).out
