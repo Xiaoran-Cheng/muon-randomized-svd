@@ -12,11 +12,11 @@ python airbench94_muon.py \
   --wandb True \
   --wandb-project adamw \
   --wandb-group final_$(date +%Y%m%d_%H%M%S) \
-  --batch-size 1000 \
-  --adamw-beta1 0.9 \
-  --adamw-beta2 0.999 \
+  --batch-size 500 \
+  --adamw-beta1 0.8755226098803631 \
+  --adamw-beta2 0.9903971024615889 \
   --adamw-eps 1e-8 \
-  --filter-adamw-lr 0.001 \
+  --filter-adamw-lr 0.004368346963334174 \
   --filter-adamw-weight-decay 0.0 \
   --sgd-momentum 0.85 \
   --sgd-nesterov True \
