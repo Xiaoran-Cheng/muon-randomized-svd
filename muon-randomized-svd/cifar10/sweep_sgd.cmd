@@ -6,7 +6,7 @@ executable = sweep.sh
 #   wandb sweep sweep_sgd.yaml         # creates sweep, prints SWEEP_ID
 #   replace <SWEEP_ID> below with the printed ID
 #   condor_submit sweep_sgd.cmd
-arguments  = xjc5161-penn-state/sgd-nesterov/3kbbn7wk 100
+arguments  = xjc5161-penn-state/sgd-nesterov/26o1ok9w 100
 
 log    = /home/xcheng328/cifar10/$(Cluster).$(Process).log
 output = /home/xcheng328/cifar10/$(Cluster).$(Process).out

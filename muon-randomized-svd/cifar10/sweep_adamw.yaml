@@ -19,8 +19,6 @@ parameters:
     distribution: uniform
     min: 0.99
     max: 0.9999
-  batch_size:
-    values: [500, 1000, 2000, 3000, 4000]
 command:
   - ${env}
   - python
@@ -38,6 +36,8 @@ command:
   - "True"
   - --wandb-project
   - adamw
+  - --batch-size
+  - "1000"
   # --- AdamW (swept + fixed) ---
   - --adamw-eps
   - "1e-8"

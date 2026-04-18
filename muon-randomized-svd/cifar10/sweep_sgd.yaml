@@ -15,8 +15,6 @@ parameters:
     distribution: uniform
     min: 0.3
     max: 0.95
-  batch_size:
-    values: [500, 1000, 2000, 3000, 4000]
 command:
   - ${env}
   - python
@@ -34,6 +32,8 @@ command:
   - "True"
   - --wandb-project
   - sgd-nesterov
+  - --batch-size
+  - "1000"
   # --- SGD (swept + fixed) ---
   - --sgd-nesterov
   - "True"

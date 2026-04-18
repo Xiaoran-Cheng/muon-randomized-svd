@@ -6,7 +6,7 @@ executable = sweep.sh
 #   wandb sweep sweep_muon_nesterov_full.yaml   # creates sweep, prints SWEEP_ID
 #   replace <SWEEP_ID> below with the printed ID
 #   condor_submit sweep_muon_nesterov_full.cmd
-arguments  = xjc5161-penn-state/muon-nesterov-full/uziae5j0 100
+arguments  = xjc5161-penn-state/muon-nesterov-full/kzs89k79 100
 
 log    = /home/xcheng328/cifar10/$(Cluster).$(Process).log
 output = /home/xcheng328/cifar10/$(Cluster).$(Process).out

@@ -82,7 +82,6 @@ def quintic_ns_theoretical(G, steps=3, eps=1e-7):
     return X
 
 
-
 @torch.compile
 def cubic_ns_theoretical(G, steps=3, eps=1e-7):
     assert len(G.shape) == 2

@@ -23,8 +23,6 @@ parameters:
       - polar_express
   orth_steps:
     values: [1, 3, 5, 7, 9]
-  batch_size:
-    values: [500, 1000, 2000, 3000, 4000]
   rank:
     values: [16, 32, 64, 128, 256]
   power_iters:
@@ -46,6 +44,8 @@ command:
   - "True"
   - --wandb-project
   - muon-polyak-rand
+  - --batch-size
+  - "1000"
   # --- SGD (for non-filter params) ---
   - --sgd-momentum
   - "0.85"

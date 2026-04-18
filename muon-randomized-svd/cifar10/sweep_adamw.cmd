@@ -6,7 +6,7 @@ executable = sweep.sh
 #   wandb sweep sweep_adamw.yaml       # creates sweep, prints SWEEP_ID
 #   replace <SWEEP_ID> below with the printed ID
 #   condor_submit sweep_adamw.cmd
-arguments  = xjc5161-penn-state/adamw/0ey6mkqh 100
+arguments  = xjc5161-penn-state/adamw/dzu5zwqh 100
 
 log    = /home/xcheng328/cifar10/$(Cluster).$(Process).log
 output = /home/xcheng328/cifar10/$(Cluster).$(Process).out

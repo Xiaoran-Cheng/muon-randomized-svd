@@ -23,8 +23,6 @@ parameters:
       - polar_express
   orth_steps:
     values: [1, 3, 5, 7, 9]
-  batch_size:
-    values: [500, 1000, 2000, 3000, 4000]
 command:
   - ${env}
   - python
@@ -42,6 +40,8 @@ command:
   - "True"
   - --wandb-project
   - muon-polyak-full
+  - --batch-size
+  - "1000"
   # --- SGD (for non-filter params) ---
   - --sgd-momentum
   - "0.85"

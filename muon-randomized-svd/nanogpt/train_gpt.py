@@ -157,39 +157,118 @@ mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 # -----------------------------------------------------------------------------
 # Polar Express
 
-# Computed for num_iters=5, safety_factor=2e-2, cushion=2
+# Computed for num_iters=9, safety_factor=2e-2, cushion=2e-2
 polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
-]
+        (8.156554524902464, -22.483292925577953, 15.878769915207462), 
+        (4.042929935166731, -2.8089174659087077, 0.5000178451051304), 
+        (3.8916678022926643, -2.772484153217687, 0.5060648178503396), 
+        (3.285753657755654, -2.368129493342538, 0.46449024233003117), 
+        (2.3005307116270957, -1.6111665557258397, 0.3833374427545274), 
+        (1.8631210546382577, -1.204216062100269, 0.3421879560523365), 
+        (1.838257215225469, -1.1779263289551445, 0.33965130386439135), 
+        (1.8382353249446173, -1.1779029764506115, 0.3396490812110979), 
+        (1.8749998851326268, -1.24999976994296, 0.37499988481033364)
+ ]
 
-@torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                  split_baddbmm: bool = False):
+# -----------------------------------------------------------------------------
+# Inexact solver registry
+#
+# All four solvers fit the same iteration form:
+#     X <- a * X + X * (b * A + c * A^2),  A = X^T X (tall) or X X^T (wide)
+# They differ only in the (a, b, c) coefficients per iteration.
+#   - cubic               : f(x) = 3/2 x - 1/2 x^3
+#   - quintic_theoretical : f(x) = 2x - 3/2 x^3 + 1/2 x^5
+#   - quintic_empirical   : Muon paper's empirical coefficients (tighter quintic)
+#   - polar_express       : 5 distinct coefficients, optimized by Amsel et al. 2025
+
+CUBIC_NS_COEFF   = (1.5, -0.5, 0.0)
+QUINTIC_TH_COEFF = (2.0, -1.5, 0.5)
+QUINTIC_EM_COEFF = (3.4445, -4.7750, 2.0315)
+
+SOLVER_REGISTRY = {
+    "cubic":               CUBIC_NS_COEFF,
+    "quintic_theoretical": QUINTIC_TH_COEFF,
+    "quintic_empirical":   QUINTIC_EM_COEFF,
+    "polar_express":       polar_express_coeffs,
+}
+
+def build_coeffs(solver: str, q: int) -> list:
+    """Return a q-length list of (a, b, c) per-iteration coefficients.
+
+    For cubic/quintic: replicate the single coefficient tuple q times.
+    For polar_express: truncate to first q if q<=5, else pad with the last
+    (converged) tuple.
     """
-    Fused Nesterov momentum + Polar Express Sign Method.
-    Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
-    orthogonalization, avoiding materialization of the FP32 intermediate between graph breaks.
+    if solver not in SOLVER_REGISTRY:
+        raise ValueError(f"Unknown solver {solver}. Options: {list(SOLVER_REGISTRY)}")
+    s = SOLVER_REGISTRY[solver]
+    if isinstance(s, tuple):
+        return [s] * q
+    # polar_express: list of distinct coeffs
+    if q <= len(s):
+        return list(s[:q])
+    return list(s) + [s[-1]] * (q - len(s))
 
-    Polar Express: https://arxiv.org/pdf/2505.16932
-    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
 
-    momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
+# -----------------------------------------------------------------------------
+# Compiled pieces: Nesterov momentum + solver-agnostic orthogonalization.
+# Extracted from the original fused polar_express so that the solver coefficients
+# and (optionally) a randomized low-rank projection can be interposed.
+
+@torch.compile(dynamic=False, fullgraph=True)
+def nesterov_momentum(grad_chunk: torch.Tensor,
+                      momentum_buffer: torch.Tensor,
+                      momentum_t: torch.Tensor) -> torch.Tensor:
+    """Nesterov momentum exactly matching MuonNesterov paper update rule:
+        C_k = beta * C_{k-1} + G_k           (momentum_buffer holds C)
+        M_k = beta * C_k     + G_k           (Nesterov lookahead)
+    A single beta is used in both positions (momentum_t).
+    Mutates momentum_buffer in place. Returns M_k in bf16.
+
+    Note: unlike the classical EMA lerp formulation, C_k here is unscaled
+    (no 1 - beta factor), so its magnitude grows ~ 1/(1-beta). Because the
+    downstream NS orthogonalizer normalizes the spectral norm internally
+    (X / ||X||), this scaling is absorbed by the orthogonalization step.
     """
-    # Nesterov momentum (in FP32)
-    momentum = momentum_t.to(grad_chunk.dtype)
-    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
-    g = grad_chunk.lerp_(momentum_buffer, momentum)
+    beta = momentum_t.to(grad_chunk.dtype)
+    # C_k = beta * C_{k-1} + G_k   (in-place update of momentum_buffer)
+    momentum_buffer.mul_(beta).add_(grad_chunk)
+    # M_k = beta * C_k + G_k
+    M = grad_chunk + beta * momentum_buffer
+    return M.bfloat16()
 
-    X = g.bfloat16()
-    is_tall = g.size(-2) > g.size(-1)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def polyak_momentum(grad_chunk: torch.Tensor,
+                    momentum_buffer: torch.Tensor,
+                    momentum_t: torch.Tensor) -> torch.Tensor:
+    """Classical Polyak (heavy-ball) momentum:
+        M_k = beta * M_{k-1} + G_k         (momentum_buffer holds M)
+    Single buffer, no Nesterov lookahead. Returns M_k in bf16.
+
+    Like nesterov_momentum, M here is unscaled (no 1 - beta factor),
+    matching the MuonNesterov paper convention. Spectral-norm normalization
+    in the orthogonalizer absorbs the scaling.
+    """
+    beta = momentum_t.to(grad_chunk.dtype)
+    # M_k = beta * M_{k-1} + G_k   (in-place update of momentum_buffer)
+    momentum_buffer.mul_(beta).add_(grad_chunk)
+    return momentum_buffer.bfloat16()
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def orthogonalize(X: torch.Tensor, coeffs: list,
+                  split_baddbmm: bool = False) -> torch.Tensor:
+    """Spectral-norm normalize X then run len(coeffs) NS iterations:
+        X <- a*X + X*(b*A + c*A^2),  A = X^T X (tall) or X X^T (wide).
+
+    Reuses XXT / XTX / ba_plus_cAA triton kernels from the original polar_express.
+    Handles 2D and 3D (batched) X identically.
+    """
+    is_tall = X.size(-2) > X.size(-1)
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
-
     X = X.contiguous()
 
     if is_tall:
@@ -198,24 +277,22 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
         B = torch.empty_like(A)
         C = torch.empty_like(X)
 
-        # Select batched vs unbatched
         if split_baddbmm:
             XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
         else:
             aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-        # Perform the iterations
-        for a, b, c in polar_express_coeffs:
+        for a, b, c in coeffs:
             XTX(X, out=A)  # A = X.T @ X
-            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)    bx^2+cx*x^4
 
             # Referencing X twice causes pytorch to make a defensive copy,
             # resulting in a cudaMemcpyAsync in baddbmm.
             # For large matrices (i.e., the mlp weights), it's faster to split
             # the operation into two kernels to avoid this.
             if split_baddbmm:
-                XB_matmul(X, B, out=C)  # C = X @ B
-                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+                XB_matmul(X, B, out=C)  # C = X @ B   # b^3 + c^5
+                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)    ax + bx^3 + c^5
             else:
                 aX_plus_XB(X, X, B, beta=a, out=C)  # C = a * X + X @ B
 
@@ -226,14 +303,12 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
         B = torch.empty_like(A)
         C = torch.empty_like(X)
 
-        # Select batched vs unbatched
         if split_baddbmm:
             BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
         else:
             aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-        # Perform the iterations
-        for a, b, c in polar_express_coeffs:
+        for a, b, c in coeffs:
             XXT(X, out=A)  # A = X @ X.mT
             ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
 
@@ -246,6 +321,74 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
             X, C = C, X  # Swap references to avoid unnecessary copies
 
     return X
+
+
+# -----------------------------------------------------------------------------
+# Randomized low-rank projection (Halko-Martinsson-Tropp 2011).
+# Runs in eager mode because torch.linalg.qr graph-breaks fullgraph=True.
+
+def _qr_reduced(Y: torch.Tensor) -> torch.Tensor:
+    """Reduced QR in FP32 (batched-safe), cast back to Y's dtype."""
+    Q, _ = torch.linalg.qr(Y.float(), mode="reduced")
+    return Q.to(Y.dtype)
+
+
+@torch.no_grad()
+def randomized_project(M: torch.Tensor, k: int, p: int, h: int):
+    """Halko-style randomized range finder.
+
+    Input M: bf16, shape (..., m, n).
+    Returns (Q, B_small, is_tall):
+      tall  (m > n):
+          Omega: (..., n, k+p),  Y = M @ Omega -> (..., m, k+p)
+          power iter h times:    Y = M @ (M^T @ Y)
+          Q = qr(Y) -> (..., m, k+p)
+          B_small = Q^T @ M -> (..., k+p, n)           [NS runs on this]
+      wide  (m <= n):
+          Omega: (..., m, k+p),  Y = M^T @ Omega -> (..., n, k+p)
+          power iter h times:    Y = M^T @ (M @ Y)
+          Q = qr(Y) -> (..., n, k+p)
+          B_small = M @ Q -> (..., m, k+p)             [NS runs on this]
+    """
+    is_tall = M.size(-2) > M.size(-1)
+    m, n = M.size(-2), M.size(-1)
+    r = k + p
+    batch_shape = M.shape[:-2]
+
+    if is_tall:
+        Omega = torch.randn((*batch_shape, n, r), device=M.device, dtype=M.dtype)
+        Y = M @ Omega
+        for _ in range(h):
+            Y = M @ (M.mT @ Y)
+        Q = _qr_reduced(Y)                 # (..., m, r)
+        B_small = Q.mT @ M                 # (..., r, n)
+        return Q, B_small, True
+    else:
+        Omega = torch.randn((*batch_shape, m, r), device=M.device, dtype=M.dtype)
+        Y = M.mT @ Omega
+        for _ in range(h):
+            Y = M.mT @ (M @ Y)
+        Q = _qr_reduced(Y)                 # (..., n, r)
+        B_small = M @ Q                    # (..., m, r)
+        return Q, B_small, False
+
+
+def orthogonalize_lowrank(M_bf16: torch.Tensor, k: int, p: int, h: int,
+                          coeffs: list) -> torch.Tensor:
+    """Randomized low-rank orthogonalization:
+        randomized_project(M) -> (Q, B_small)
+        B_orth = orthogonalize(B_small, coeffs)
+        lift: Q @ B_orth  (tall)  or  B_orth @ Q^T  (wide)
+
+    The NS iteration runs on the small (k+p)-dim side, not the full m x n matrix.
+    """
+    Q, B_small, is_tall = randomized_project(M_bf16, k, p, h)
+    # B_small is small on one side; no need to split baddbmm
+    B_orth = orthogonalize(B_small, coeffs, split_baddbmm=False)
+    if is_tall:
+        return Q @ B_orth
+    else:
+        return B_orth @ Q.mT
 
 # -----------------------------------------------------------------------------
 # Sparse Comms for bigram embedding gradient reduce-scatter
@@ -362,6 +505,13 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    # Randomized-Muon research additions
+    momentum_type: str = "nesterov"   # "nesterov" | "polyak"
+    use_randomized: bool = False
+    k: int = 0                    # absolute rank; computed in _build_param_cfg from rank_ratio
+    oversampling: int = 10
+    power_iter: int = 1
+    coeffs: list | None = None    # (a,b,c) list from build_coeffs(solver, ns_steps)
 
 
 class NorMuonAndAdam:
@@ -514,6 +664,23 @@ class NorMuonAndAdam:
                     is_c_proj = (global_idx % 2 == 1)
                     per_matrix_lr_mul.append(2.0 if is_c_proj else 1.0)
 
+            # Solver + randomized-projection settings (research additions)
+            solver = self.normuon_defaults.get("solver", "polar_express")
+            ns_steps = self.normuon_defaults.get("ns_steps", 5)
+            coeffs = build_coeffs(solver, ns_steps)
+
+            use_randomized = self.normuon_defaults.get("use_randomized", False)
+            rank_ratio = self.normuon_defaults.get("rank_ratio", 0.125)
+            # k is absolute rank; min 8 keeps QR well-defined. Use last dim of
+            # the per-chunk matrix (columns of a tall chunk, rows of a wide one).
+            k_abs = max(8, int(round(rank_ratio * chunk_shape[-1])))
+            oversampling = self.normuon_defaults.get("oversampling", 10)
+            power_iter = self.normuon_defaults.get("power_iter", 1)
+
+            momentum_type = self.normuon_defaults.get("momentum_type", "nesterov")
+            if momentum_type not in ("nesterov", "polyak"):
+                raise ValueError(f"momentum_type must be 'nesterov' or 'polyak', got {momentum_type!r}")
+
             p_cfg = ParamConfig(
                 label=label,
                 optim=optim,
@@ -529,6 +696,12 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
+                use_randomized=use_randomized,
+                k=k_abs,
+                oversampling=oversampling,
+                power_iter=power_iter,
+                coeffs=coeffs,
+                momentum_type=momentum_type,
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -870,12 +1043,30 @@ class NorMuonAndAdam:
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Fused Nesterov momentum + Polar Express orthogonalization
+        # 1. Momentum step (Nesterov or Polyak heavy-ball, selected per-param)
+        if p_cfg.momentum_type == "nesterov":
+            # MuonNesterov paper: C_k = beta*C_{k-1}+G_k, M_k = beta*C_k+G_k
+            M_bf16 = nesterov_momentum(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t
+            )
+        else:  # "polyak"
+            # Heavy-ball: M_k = beta*M_{k-1} + G_k
+            M_bf16 = polyak_momentum(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t
+            )
+
+        # 2. Orthogonalize (full NS, or with randomized low-rank projection)
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
-        )
+        if p_cfg.use_randomized:
+            v_chunk = orthogonalize_lowrank(
+                M_bf16,
+                k=p_cfg.k, p=p_cfg.oversampling, h=p_cfg.power_iter,
+                coeffs=p_cfg.coeffs,
+            )
+        else:
+            v_chunk = orthogonalize(
+                M_bf16, coeffs=p_cfg.coeffs, split_baddbmm=is_large_matrix,
+            )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -1560,6 +1751,19 @@ class Hyperparameters:
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # -------------------------------------------------------------------------
+    # Randomized-Muon research additions (env-var configurable for sweeps)
+    # Defaults reproduce the original file's behavior:
+    #   - polar_express with 5 iterations
+    #   - no randomized projection (full NS on the unprojected momentum matrix)
+    # Override via env vars when launching torchrun.
+    solver:         str   = os.environ.get("SOLVER", "polar_express")
+    ns_steps:       int   = int(os.environ.get("NS_STEPS", 5))
+    use_randomized: bool  = os.environ.get("USE_RANDOMIZED", "0") == "1"
+    rank_ratio:     float = float(os.environ.get("RANK_RATIO", 0.125))
+    oversampling:   int   = int(os.environ.get("OVERSAMPLING", 10))
+    power_iter:     int   = int(os.environ.get("POWER_ITER", 1))
+    momentum_type:  str   = os.environ.get("MOMENTUM_TYPE", "nesterov")   # "nesterov" | "polyak"
 
 args = Hyperparameters()
 
@@ -1714,6 +1918,14 @@ class TrainingManager():
             momentum=0.95,
             beta2=0.9,
             weight_decay=1.2,
+            # Randomized-Muon research additions, forwarded via _build_param_cfg
+            solver=args.solver,
+            ns_steps=args.ns_steps,
+            use_randomized=args.use_randomized,
+            rank_ratio=args.rank_ratio,
+            oversampling=args.oversampling,
+            power_iter=args.power_iter,
+            momentum_type=args.momentum_type,
         )
 
         self.optimizer = NorMuonAndAdam(
