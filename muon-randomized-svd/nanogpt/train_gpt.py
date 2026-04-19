@@ -8,13 +8,15 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
 
+import argparse
 import copy
 import glob
 import math
+import pickle
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
@@ -489,7 +491,7 @@ def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
 class ParamConfig:
     """Per-parameter configuration for NorMuonAndAdam optimizer."""
     label: str
-    optim: str  # "adam" or "normuon"
+    optim: str  # "adam" | "normuon" | "sgd_nesterov"
     comms: str  # "none", "replicated", "sharded" or "sharded_sparse"
     adam_betas: tuple[float, float] | None
     lr_mul: float
@@ -512,6 +514,8 @@ class ParamConfig:
     oversampling: int = 10
     power_iter: int = 1
     coeffs: list | None = None    # (a,b,c) list from build_coeffs(solver, ns_steps)
+    # E5 baseline-variant control (step gating)
+    step_gated: bool = False      # True = update only on odd steps (current Adam behavior under Muon variant)
 
 
 class NorMuonAndAdam:
@@ -566,12 +570,17 @@ class NorMuonAndAdam:
     # @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
     """
     def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
-                 adam_defaults: dict, normuon_defaults: dict):
+                 adam_defaults: dict, normuon_defaults: dict,
+                 sgd_defaults: dict | None = None):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Store defaults for each optimizer type
         self.adam_defaults = adam_defaults
         self.normuon_defaults = normuon_defaults
+        # sgd_defaults is only used when param_table routes params to "sgd_nesterov".
+        # Default empty dict so SGD branch in _build_param_cfg can fail cleanly if
+        # caller forgot to pass defaults.
+        self.sgd_defaults = sgd_defaults or {}
         self.param_table = param_table
         self.scatter_order = scatter_order
         self.work_order = work_order
@@ -627,6 +636,9 @@ class NorMuonAndAdam:
 
         if optim == "adam":
             chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
+            # step_gated defaults to True for Adam under Muon variant (existing behavior:
+            # Adam updates only on odd steps). AdamW baseline overrides to False.
+            step_gated = table_entry.get("step_gated", True)
             p_cfg = ParamConfig(
                 label=label,
                 optim=optim,
@@ -639,6 +651,7 @@ class NorMuonAndAdam:
                 weight_decay=self.adam_defaults["weight_decay"],
                 eps=self.adam_defaults["eps"],
                 chunk_size=chunk_size,
+                step_gated=step_gated,
             )
         elif optim == "normuon":
             reshape = getattr(param, "reshape", None)
@@ -671,9 +684,13 @@ class NorMuonAndAdam:
 
             use_randomized = self.normuon_defaults.get("use_randomized", False)
             rank_ratio = self.normuon_defaults.get("rank_ratio", 0.125)
-            # k is absolute rank; min 8 keeps QR well-defined. Use last dim of
-            # the per-chunk matrix (columns of a tall chunk, rows of a wide one).
-            k_abs = max(8, int(round(rank_ratio * chunk_shape[-1])))
+            rank_abs_cli = int(self.normuon_defaults.get("rank_abs", 0) or 0)
+            if rank_abs_cli > 0:
+                # --rank from CLI: absolute rank, clip to matrix last dim.
+                k_abs = max(8, min(rank_abs_cli, chunk_shape[-1]))
+            else:
+                # Fallback: rank_ratio * chunk_shape[-1]. Min 8 keeps QR well-defined.
+                k_abs = max(8, int(round(rank_ratio * chunk_shape[-1])))
             oversampling = self.normuon_defaults.get("oversampling", 10)
             power_iter = self.normuon_defaults.get("power_iter", 1)
 
@@ -702,6 +719,29 @@ class NorMuonAndAdam:
                 power_iter=power_iter,
                 coeffs=coeffs,
                 momentum_type=momentum_type,
+            )
+        elif optim == "sgd_nesterov":
+            # E5 baseline: classical SGD+Nesterov, applied to every parameter.
+            # Shards along dim 0 when comms is "sharded" (same as Adam); uses
+            # full param when "replicated". Big matrices (attn_bank / mlp_bank)
+            # are set to "replicated" by TrainingManager when routing to this path.
+            chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
+            sgd_momentum = self.sgd_defaults.get("momentum", 0.95)
+            sgd_nesterov = bool(self.sgd_defaults.get("nesterov", True))
+            p_cfg = ParamConfig(
+                label=label,
+                optim=optim,
+                comms=comms,
+                adam_betas=None,
+                lr_mul=lr_mul,
+                wd_mul=wd_mul,
+                lr=self.sgd_defaults["lr"],
+                initial_lr=self.sgd_defaults["lr"],
+                weight_decay=self.sgd_defaults.get("weight_decay", 0.0),
+                chunk_size=chunk_size,
+                momentum=sgd_momentum,
+                momentum_type=("nesterov" if sgd_nesterov else "polyak"),
+                step_gated=False,          # SGD baseline updates every step
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -747,6 +787,18 @@ class NorMuonAndAdam:
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
                 )
+
+            elif p_cfg.optim == "sgd_nesterov":
+                # Mirror Adam's sharded/replicated allocation pattern.
+                # Only a single FP32 momentum buffer (no second moment, no mantissa).
+                if p_cfg.comms.startswith("sharded"):
+                    chunk = param[:p_cfg.chunk_size]
+                else:
+                    chunk = param
+                momentum_buffer = torch.zeros_like(
+                    chunk, dtype=torch.float32, device=param.device
+                )
+                self.param_states[param] = dict(momentum_buffer=momentum_buffer)
 
     # -----------------------------------
     # Reduce/Gather operations
@@ -913,7 +965,7 @@ class NorMuonAndAdam:
             param = self._param_by_label[label]
             p_cfg = self.param_cfgs[param]
 
-            if p_cfg.optim == "adam" and not do_adam:
+            if p_cfg.step_gated and not do_adam:
                 continue
             if param.grad is None:
                 continue
@@ -939,7 +991,7 @@ class NorMuonAndAdam:
                 continue
 
             p_cfg = self.param_cfgs[param]
-            if p_cfg.optim == "adam" and not do_adam:
+            if p_cfg.step_gated and not do_adam:
                 continue
             # Wait for reduce
             if p_cfg.comms != "sharded_sparse":
@@ -956,7 +1008,9 @@ class NorMuonAndAdam:
             # Apply update based on optim type
             if p_cfg.optim == "adam":
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
-            else:
+            elif p_cfg.optim == "sgd_nesterov":
+                p_slice = self._sgd_nesterov_update(param, grad_chunk, p_cfg, rank)
+            else:  # "normuon"
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
             # Launch gather for sharded params
             if p_cfg.comms.startswith("sharded") and self.world_size > 1:
@@ -984,8 +1038,8 @@ class NorMuonAndAdam:
 
         # Clear grads for updated params
         for param, p_cfg in self.param_cfgs.items():
-            if p_cfg.optim == "adam" and not do_adam:
-                continue  # Don't clear Adam grads on even steps
+            if p_cfg.step_gated and not do_adam:
+                continue  # Don't clear grads for gated params on skipped steps
             param.grad = None
 
     # -----------------------------------
@@ -1028,6 +1082,56 @@ class NorMuonAndAdam:
         mask = (update * p_slice) > 0
         update.addcmul_(p_slice, mask, value=eff_wd_t)
         p_slice.add_(other=update, alpha=-1.0)
+
+    # -----------------------------------
+    # SGD + Nesterov update (E5 baseline)
+
+    def _sgd_nesterov_update(self, param: nn.Parameter, grad_chunk: Tensor,
+                             p_cfg: ParamConfig, rank: int) -> Tensor:
+        """Classical SGD with momentum. Returns the updated p_slice.
+
+        momentum_type == "nesterov": Nesterov lookahead, equivalent to
+            torch.optim.SGD(lr, momentum=beta, nesterov=True, weight_decay=wd).
+        momentum_type == "polyak":   Plain heavy-ball momentum, equivalent to
+            torch.optim.SGD(lr, momentum=beta, nesterov=False, weight_decay=wd).
+
+        Inlined here (instead of using torch.optim.SGD directly) because
+        NorMuonAndAdam owns gradient communication via explicit reduce_scatter /
+        all_gather scheduled through scatter_order / work_order. torch.optim.SGD
+        assumes DDP hook-driven grad sync, which this optimizer bypasses.
+
+        Update rule (paper convention, single beta):
+            C_k = beta * C_{k-1} + G_k           (momentum_buffer)
+            Nesterov: step = beta * C_k + G_k     (lookahead)
+            Polyak:   step = C_k                  (buffer itself)
+            p -= lr * step                        (with decoupled WD)
+        """
+        lr = p_cfg.lr * p_cfg.lr_mul
+        beta = p_cfg.momentum
+        wd = p_cfg.weight_decay * p_cfg.wd_mul
+
+        if p_cfg.comms.startswith("sharded"):
+            p_slice = param[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
+        else:
+            p_slice = param
+
+        p_state = self.param_states[param]
+        buf = p_state["momentum_buffer"]      # FP32
+        g = grad_chunk.float()
+
+        # C_k = beta * C_{k-1} + G_k   (in-place)
+        buf.mul_(beta).add_(g)
+        if p_cfg.momentum_type == "polyak":
+            step_vec = buf                     # heavy-ball: use accumulator directly
+        else:
+            step_vec = g.add(buf, alpha=beta)  # Nesterov lookahead (new FP32 tensor)
+
+        # Decoupled weight decay + update (in-place on bf16 param)
+        if wd > 0.0:
+            p_slice.mul_(1.0 - lr * wd)
+        p_slice.add_(step_vec.to(p_slice.dtype), alpha=-lr)
+
+        return p_slice
 
     # -----------------------------------
     # NorMuon update
@@ -1764,8 +1868,183 @@ class Hyperparameters:
     oversampling:   int   = int(os.environ.get("OVERSAMPLING", 10))
     power_iter:     int   = int(os.environ.get("POWER_ITER", 1))
     momentum_type:  str   = os.environ.get("MOMENTUM_TYPE", "nesterov")   # "nesterov" | "polyak"
+    # E5 baseline variant: route all params through one optimizer
+    optimizer_variant: str = os.environ.get("OPTIMIZER_VARIANT", "muon")  # "muon" | "adamw" | "sgd_nesterov"
+    sgd_lr:            float = float(os.environ.get("SGD_LR", 0.003))
+    adamw_lr:          float = float(os.environ.get("ADAMW_LR", 0.001))
+    # -------------------------------------------------------------------------
+    # CLI-controlled fields (merged from argparse after instantiation).
+    # Defaults here reproduce prior behavior when no CLI flag is passed.
+    num_trials:    int  = 1
+    log_every:     int  = 50           # val_loss cadence; train_loss is logged every step
+    sgd_momentum:  float = 0.95
+    sgd_nesterov:  bool  = True
+    muon_lr:       float = 0.023       # matches current normuon_defaults["lr"]
+    muon_momentum: float = 0.95        # peak value of the Muon momentum warmup
+    muon_nesterov: bool  = True        # True → Nesterov; False → Polyak (mirrors --muon-nesterov)
+    rank:          int   = 0           # 0 → fall back to rank_ratio; otherwise absolute rank
+    seed_base:     int   = 0           # trial_id is added to this for per-trial fresh init
+    cli_args_dict: dict  = field(default_factory=dict)   # snapshot of parsed argparse values, for folder naming
+
+
+def _parse_bool_cli(x):
+    return str(x).lower() in ("true", "1", "yes", "t")
+
+
+def _build_cli_parser():
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--optimizer-mode", "--optimizer_mode", type=str, default=None,
+                   choices=("muon", "adamw", "sgd_nesterov"),
+                   help="muon (default) | adamw | sgd_nesterov. Routes every param through chosen optimizer when != muon.")
+    p.add_argument("--num-trials", "--num_trials", type=int, default=1,
+                   help="Number of training trials to run in this invocation, each with fresh random init.")
+    p.add_argument("--log-every", "--log_every", type=int, default=50,
+                   help="Evaluate val_loss every N training steps (train_loss is recorded every step regardless).")
+    # SGD+Nesterov baseline
+    p.add_argument("--sgd-momentum", "--sgd_momentum", type=float, default=0.95)
+    p.add_argument("--sgd-nesterov", "--sgd_nesterov", type=_parse_bool_cli, default=True,
+                   help="True (default): Nesterov lookahead. False: plain heavy-ball momentum.")
+    p.add_argument("--sgd-lr", "--sgd_lr", type=float, default=None)
+    # Muon
+    p.add_argument("--muon-lr", "--muon_lr", type=float, default=None,
+                   help="Override normuon_defaults['lr'] (default 0.023 from speedrun).")
+    p.add_argument("--muon-momentum", "--muon_momentum", type=float, default=0.95,
+                   help="Peak value of Muon momentum warmup schedule.")
+    p.add_argument("--muon-nesterov", "--muon_nesterov", type=_parse_bool_cli, default=True,
+                   help="True: Nesterov momentum. False: Polyak (heavy-ball).")
+    # AdamW baseline
+    p.add_argument("--adamw-lr", "--adamw_lr", type=float, default=None)
+    # Inexact NS solver
+    p.add_argument("--inexact-solver", "--inexact_solver", type=str, default=None,
+                   choices=("cubic", "quintic_theoretical", "quintic_empirical", "polar_express"))
+    p.add_argument("--orth-steps", "--orth_steps", type=int, default=None,
+                   help="Number of NS iterations for the inexact solver.")
+    # Randomized projection
+    p.add_argument("--randomized", type=_parse_bool_cli, default=None,
+                   help="Enable Halko randomized low-rank projection before the NS solver.")
+    p.add_argument("--rank", type=int, default=0,
+                   help="Absolute target rank k for randomized projection. 0 = fall back to rank_ratio semantics.")
+    p.add_argument("--oversampling", type=int, default=None)
+    p.add_argument("--power-iters", "--power_iters", type=int, default=None)
+    # Output dir / logging
+    p.add_argument("--log-root", "--log_root", type=str, default="Logs",
+                   help="Root directory for per-run pkl outputs (default: Logs/).")
+    return p
+
+
+cli_parser = _build_cli_parser()
+cli_args, _cli_unknown = cli_parser.parse_known_args()
 
 args = Hyperparameters()
+
+
+def _merge_cli_into_args(args: Hyperparameters, cli_args: argparse.Namespace) -> None:
+    """CLI values override env-var-derived Hyperparameters defaults when provided."""
+    if cli_args.optimizer_mode is not None:
+        args.optimizer_variant = cli_args.optimizer_mode
+    if cli_args.inexact_solver is not None:
+        args.solver = cli_args.inexact_solver
+    if cli_args.orth_steps is not None:
+        args.ns_steps = cli_args.orth_steps
+    if cli_args.randomized is not None:
+        args.use_randomized = cli_args.randomized
+    if cli_args.oversampling is not None:
+        args.oversampling = cli_args.oversampling
+    if cli_args.power_iters is not None:
+        args.power_iter = cli_args.power_iters
+    if cli_args.sgd_lr is not None:
+        args.sgd_lr = cli_args.sgd_lr
+    if cli_args.adamw_lr is not None:
+        args.adamw_lr = cli_args.adamw_lr
+    if cli_args.muon_lr is not None:
+        args.muon_lr = cli_args.muon_lr
+    # Muon Nesterov toggle maps onto the existing momentum_type field.
+    args.momentum_type = "nesterov" if cli_args.muon_nesterov else "polyak"
+    args.muon_nesterov  = cli_args.muon_nesterov
+    args.muon_momentum  = cli_args.muon_momentum
+    args.sgd_momentum   = cli_args.sgd_momentum
+    args.sgd_nesterov   = cli_args.sgd_nesterov
+    args.num_trials     = cli_args.num_trials
+    args.log_every      = cli_args.log_every
+    # args.rank (absolute). 0 → keep using rank_ratio in _build_param_cfg.
+    args.rank           = cli_args.rank
+    # Snapshot for folder naming later.
+    args.cli_args_dict  = vars(cli_args)
+    # --log-every also overrides val_loss cadence.
+    args.val_loss_every = cli_args.log_every
+
+
+_merge_cli_into_args(args, cli_args)
+
+
+# -----------------------------------------------------------------------------
+# Output directory naming (mirrors cifar10/airbench94_muon.py convention).
+# Folder layout:  {log_root}/{optimizer_mode}/{abbrev1}{val1}_{abbrev2}{val2}.../
+# Contents:       losses.pkl  (train/val loss tables across trials)
+# -----------------------------------------------------------------------------
+ARG_ABBREVIATIONS = {
+    "optimizer_mode":  "om",
+    "num_trials":      "nt",
+    "log_every":       "le",
+    "inexact_solver":  "is",
+    "orth_steps":      "os",
+    "randomized":      "rz",
+    "rank":            "rk",
+    "oversampling":    "ov",
+    "power_iters":     "pi",
+    "muon_lr":         "mlr",
+    "muon_momentum":   "mmm",
+    "muon_nesterov":   "mn",
+    "sgd_lr":          "slr",
+    "sgd_momentum":    "smm",
+    "sgd_nesterov":    "sn",
+    "adamw_lr":        "alr",
+}
+
+# Per-mode list of CLI args whose values go into the folder name, in order.
+MODE_FOLDER_ARGS = {
+    "muon": [
+        "muon_lr", "muon_momentum", "muon_nesterov",
+        "inexact_solver", "orth_steps",
+        "randomized", "rank", "oversampling", "power_iters",
+        "num_trials", "log_every",
+    ],
+    "sgd_nesterov": [
+        "sgd_lr", "sgd_momentum", "sgd_nesterov",
+        "num_trials", "log_every",
+    ],
+    "adamw": [
+        "adamw_lr",
+        "num_trials", "log_every",
+    ],
+}
+
+
+def _format_arg_value(value):
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "t" if value else "f"
+    if isinstance(value, float):
+        text = f"{value:g}"
+    else:
+        text = str(value)
+    return text.replace("-", "m").replace(".", "p").replace("/", "_")
+
+
+def build_output_dir(args, cli_args):
+    mode = args.optimizer_variant
+    folder_args = MODE_FOLDER_ARGS.get(mode, list(vars(cli_args).keys()))
+    arg_items = vars(cli_args)
+    parts = []
+    for key in folder_args:
+        if key not in arg_items:
+            continue
+        abbr = ARG_ABBREVIATIONS.get(key, key)
+        parts.append(f"{abbr}{_format_arg_value(arg_items[key])}")
+    folder_name = "_".join(parts) or "default"
+    output_dir = os.path.join(cli_args.log_root, mode, folder_name)
+    return output_dir
 
 @dataclass
 class TrainingStage:
@@ -1849,7 +2128,9 @@ TRAINING_STAGES = [
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
-def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
+def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=None):
+    if momentum_max is None:
+        momentum_max = args.muon_momentum
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
     momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
@@ -1898,6 +2179,32 @@ class TrainingManager():
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
+        # E5 baseline override: route all params through a single optimizer.
+        # attn_bank / mlp_bank cannot be sharded along dim 0 (first dims 10 and 12
+        # are not divisible by world_size=8), so they go replicated under these
+        # baselines. bigram_embed drops sharded_sparse because the sparse comms
+        # path is NorMuon/Adam-specific.
+        if args.optimizer_variant == "adamw":
+            for key, entry in self.param_table.items():
+                entry["optim"] = "adam"
+                entry["step_gated"] = False  # baseline updates every step
+                if entry.get("adam_betas") is None:
+                    entry["adam_betas"] = [0.9, 0.95]
+            self.param_table["attn_bank"]["comms"] = "replicated"
+            self.param_table["mlp_bank"]["comms"]  = "replicated"
+        elif args.optimizer_variant == "sgd_nesterov":
+            for key, entry in self.param_table.items():
+                entry["optim"] = "sgd_nesterov"
+                entry["step_gated"] = False
+                entry.pop("adam_betas", None)
+            self.param_table["attn_bank"]["comms"]    = "replicated"
+            self.param_table["mlp_bank"]["comms"]     = "replicated"
+            self.param_table["bigram_embed"]["comms"] = "sharded"
+        elif args.optimizer_variant != "muon":
+            raise ValueError(
+                f"OPTIMIZER_VARIANT must be 'muon', 'adamw', or 'sgd_nesterov'; got {args.optimizer_variant!r}"
+            )
+
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
@@ -1914,8 +2221,8 @@ class TrainingManager():
         )
 
         normuon_defaults = dict(
-            lr=0.023,
-            momentum=0.95,
+            lr=args.muon_lr,
+            momentum=args.muon_momentum,
             beta2=0.9,
             weight_decay=1.2,
             # Randomized-Muon research additions, forwarded via _build_param_cfg
@@ -1923,10 +2230,23 @@ class TrainingManager():
             ns_steps=args.ns_steps,
             use_randomized=args.use_randomized,
             rank_ratio=args.rank_ratio,
+            rank_abs=args.rank,                  # 0 → use rank_ratio; >0 → absolute rank
             oversampling=args.oversampling,
             power_iter=args.power_iter,
             momentum_type=args.momentum_type,
         )
+
+        sgd_defaults = dict(
+            lr=args.sgd_lr,
+            momentum=args.sgd_momentum,
+            weight_decay=0.0,
+            nesterov=args.sgd_nesterov,
+        )
+
+        # AdamW baseline overrides the global Adam LR (different optimal LR when
+        # big projection matrices also go through Adam).
+        if args.optimizer_variant == "adamw":
+            adam_defaults = dict(adam_defaults, lr=args.adamw_lr)
 
         self.optimizer = NorMuonAndAdam(
             model.named_parameters(),
@@ -1935,6 +2255,7 @@ class TrainingManager():
             work_order=self.work_order,
             adam_defaults=adam_defaults,
             normuon_defaults=normuon_defaults,
+            sgd_defaults=sgd_defaults,
         )
 
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
@@ -2138,79 +2459,154 @@ print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
-del val_loader, train_loader, initial_state
+del val_loader, train_loader
 model.train()
 
 ########################################
-#        Training and validation       #
+#     Per-trial training + logging     #
 ########################################
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-
-gc.collect()
-
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-# begin training
 train_steps = training_schedule.total_steps
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
-    training_manager.advance_schedule(step)
-    # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if last_step:
-            training_manager.apply_final_ws_ext()
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-        val_loss /= val_steps
-        del val_loader
-        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+trial_outputs: list[dict] = []
+
+for trial_id in range(args.num_trials):
+    print0(f"========== Trial {trial_id + 1}/{args.num_trials} ==========", console=True)
+    # Restore model + optimizer to post-warmup initial state (same weights every trial;
+    # per-trial variation comes from CUDA nondeterminism + data-order differences).
+    if trial_id > 0:
+        model.zero_grad(set_to_none=True)
+        model.load_state_dict(initial_state["model"])
+        training_manager.reset(initial_state["optimizer"])
         model.train()
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
 
-    if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
-        # the last step only has the validation loop, so break to avoid training
-        break
+    train_loader = distributed_data_generator(
+        args.train_files,
+        TRAINING_STAGES[0].batch_size,
+        TRAINING_STAGES[0].train_max_seq_len,
+        grad_accum_steps=grad_accum_steps,
+    )
+    gc.collect()
 
-    # --------------- TRAINING SECTION -----------------
-    for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
-        training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
-        training_manager.sparse_index_share(step)
-        loss.backward()
-        del loss
-    training_manager.step_optimizers(step)
+    train_losses: list[float] = []     # one entry per training step (length == train_steps)
+    val_loss_records: list[tuple[int, float]] = []   # (step, val_loss) pairs
 
-    # logging
-    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    training_time_ms = 0
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+        training_manager.advance_schedule(step)
+        # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            if last_step:
+                training_manager.apply_final_ws_ext()
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            model.eval()
+            assert args.val_tokens % args.val_batch_size == 0
+            val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+            val_loader = distributed_data_generator(
+                args.val_files, args.val_batch_size, -1,
+                grad_accum_steps=grad_accum_steps, align_to_bos=False,
+            )
+            val_loss = 0
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                    val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+            val_loss /= val_steps
+            del val_loader
+            dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+            val_loss_scalar = float(val_loss.item())
+            val_loss_records.append((step, val_loss_scalar))
+            print0(f"[trial {trial_id + 1}] step:{step}/{train_steps} val_loss:{val_loss_scalar:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if master_process and args.save_checkpoint and trial_id == args.num_trials - 1:
+                log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
+                os.makedirs(f"logs/{args.run_id}", exist_ok=True)
+                torch.save(log, f"logs/{args.run_id}/state_step{step:06d}.pt")
+            break
+
+        # --------------- TRAINING SECTION -----------------
+        train_loss_accum = torch.zeros((), device="cuda")
+        for idx in range(grad_accum_steps):
+            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+            training_manager.sparse_index_update(step, bigram_cpu)
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+            training_manager.sparse_index_share(step)
+            loss.backward()
+            train_loss_accum = train_loss_accum + loss.detach()
+            del loss
+        training_manager.step_optimizers(step)
+        dist.reduce(train_loss_accum, 0, op=dist.ReduceOp.AVG)
+        train_losses.append(float(train_loss_accum.item()))
+
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    trial_outputs.append({
+        "trial_id": trial_id,
+        "train_losses": train_losses,
+        "val_loss_records": val_loss_records,
+    })
+    del train_loader
+    gc.collect()
+    torch.cuda.empty_cache()
+
+########################################
+#           Save losses to pkl         #
+########################################
+if master_process and len(trial_outputs) > 0:
+    output_dir = build_output_dir(args, cli_args)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Aligned val-step axis (all trials share the same cadence, verified below).
+    val_steps_ref = [s for (s, _) in trial_outputs[0]["val_loss_records"]]
+    for out in trial_outputs:
+        if [s for (s, _) in out["val_loss_records"]] != val_steps_ref:
+            raise RuntimeError("val_loss step indices differ across trials; cannot align columns")
+
+    train_step_axis = list(range(train_steps))
+    num_trials_run = len(trial_outputs)
+
+    train_columns, train_values = [], []
+    val_columns, val_values = [], []
+    for t_idx, out in enumerate(trial_outputs):
+        train_columns.append(f"trial_{t_idx:03d}_train_loss")
+        train_values.append(out["train_losses"])
+        val_columns.append(f"trial_{t_idx:03d}_val_loss")
+        val_values.append([v for (_, v) in out["val_loss_records"]])
+
+    # Transpose so each column corresponds to one trial (rows = step axis).
+    train_values_t = list(map(list, zip(*train_values))) if train_values else []
+    val_values_t   = list(map(list, zip(*val_values)))   if val_values   else []
+
+    payload = {
+        "train_steps": train_step_axis,
+        "train_columns": train_columns,
+        "train_values": train_values_t,
+        "val_steps": val_steps_ref,
+        "val_columns": val_columns,
+        "val_values": val_values_t,
+        "args": vars(cli_args),
+        "num_trials": num_trials_run,
+    }
+    pkl_path = os.path.join(output_dir, "losses.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
+    print0(f"Saved losses to {pkl_path}", console=True)
 
 if args.run_evals:
     model.eval()
     from evals import hellaswag
-    hellaswag.evaluate(model=model, 
-                       schedule_cfg=training_manager.get_forward_args(), 
+    hellaswag.evaluate(model=model,
+                       schedule_cfg=training_manager.get_forward_args(),
                        seq_len=args.val_batch_size // (grad_accum_steps * world_size),
-                       get_bigram_hash=get_bigram_hash, 
+                       get_bigram_hash=get_bigram_hash,
                        print0=print0)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "

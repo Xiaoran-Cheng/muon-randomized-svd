@@ -15,8 +15,8 @@ python airbench94_muon.py \
   --batch-size 1000 \
   --sgd-momentum 0.85 \
   --sgd-nesterov True \
-  --muon-lr 0.14924799276952783 \
-  --muon-momentum 0.49283224551213034 \
+  --muon-lr 0.12165676406973672 \
+  --muon-momentum 0.6099305887133548 \
   --muon-nesterov False \
   --filter-sgd-lr 0.24 \
   --filter-sgd-weight-decay 0.0 \

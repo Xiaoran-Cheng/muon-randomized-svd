@@ -12,11 +12,11 @@ python airbench94_muon.py \
   --wandb True \
   --wandb-project muon-nesterov-full \
   --wandb-group final_$(date +%Y%m%d_%H%M%S) \
-  --batch-size 2000 \
+  --batch-size 1000 \
   --sgd-momentum 0.85 \
   --sgd-nesterov True \
-  --muon-lr 0.18933257791824504 \
-  --muon-momentum 0.6609439777752251 \
+  --muon-lr 0.16518478860800093 \
+  --muon-momentum 0.7107321937521904 \
   --muon-nesterov True \
   --filter-sgd-lr 0.24 \
   --filter-sgd-weight-decay 0.0 \
@@ -26,7 +26,7 @@ python airbench94_muon.py \
   --filter-adamw-lr 0.24 \
   --filter-adamw-weight-decay 0.0 \
   --inexact_solver polar_express \
-  --orth-steps 9 \
+  --orth-steps 7 \
   --randomized False \
   --rank 32 \
   --oversampling 10 \
