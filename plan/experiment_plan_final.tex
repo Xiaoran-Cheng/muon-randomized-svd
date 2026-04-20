@@ -5,6 +5,8 @@
 \usepackage{enumitem}
 \usepackage{hyperref}
 \usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
 
 \title{Experiment Design: Analysis of Muon with Nesterov Momentum}
 \author{}
@@ -216,6 +218,188 @@ Explore the empirical relation between a target accuracy threshold $\varepsilon$
 \begin{itemize}[nosep]
 \item one plot of stopping step $K$ versus $\varepsilon$;
 \end{itemize}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{CIFAR-10 Results}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+All curves are averaged over 50 trials; shaded bands show $\pm 1$ standard deviation. Test accuracies are reported as mean $\pm$ std over trials.
+
+\paragraph{Fixed parameters across experiments.} Each ablation sweeps one parameter while fixing the others; later experiments use the values selected by earlier ones.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Exp.} & \textbf{Solver} & \textbf{Rank $k$} & \textbf{NS iterations $q$} & \textbf{Batch size $B$} \\
+\midrule
+E1 & sweep                 & 256         & 5           & 2000 \\
+E2 & Quintic (theoretical) & sweep       & 5           & 2000 \\
+E3 & Quintic (theoretical) & 256         & sweep       & 2000 \\
+E4 & Quintic (theoretical) & 256         & 9           & sweep        \\
+E5 & Quintic (theoretical) & 256         & 9           & 1000         \\
+\bottomrule
+\end{tabular}
+\caption{Configuration used in each experiment. ``sweep'' marks the parameter varied in that row; ``prov.'' marks a provisional value used before the corresponding ablation has been run.}
+\end{table}
+
+\newcommand{\resultdir}{../muon-randomized-svd/cifar10/experiment_result}
+
+\subsection{E5: Comparison with External Methods}
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/E5_val_loss.png}
+\caption{Validation loss}
+\end{subfigure}
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/E5_train_loss.png}
+\caption{Training loss}
+\end{subfigure}
+\caption{E5: validation and training loss for each method.}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Method} & \textbf{Test accuracy (mean $\pm$ std)} \\
+\midrule
+AdamW                         & $0.9106 \pm 0.0026$ \\
+SGD-Nesterov                  & $0.9091 \pm 0.0035$ \\
+Muon Polyak (full SVD)        & $0.9380 \pm 0.0013$ \\
+Muon Polyak (rand SVD)        & $0.9378 \pm 0.0012$ \\
+Muon Nesterov (full SVD)      & $0.9377 \pm 0.0011$ \\
+\textbf{Muon Nesterov (rand SVD)}      & $\mathbf{0.9383 \pm 0.0014}$ \\
+\bottomrule
+\end{tabular}
+\caption{E5: final TTA test accuracy.}
+\end{table}
+
+\subsection{E1: Solver Ablation}
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E1_solvers_val_loss.png}
+\caption{Validation loss}
+\end{subfigure}
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E1_solvers_train_loss.png}
+\caption{Training loss}
+\end{subfigure}
+\caption{E1: validation and training loss by solver.}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Solver} & \textbf{Test accuracy (mean $\pm$ std)} \\
+\midrule
+Polar Express          & $0.9384 \pm 0.0014$ \\
+Cubic (theoretical)    & $0.9383 \pm 0.0012$ \\
+\textbf{Quintic (theoretical)}  & $\mathbf{0.9384 \pm 0.0016}$ \\
+Quintic (empirical)    & $0.9382 \pm 0.0013$ \\
+\bottomrule
+\end{tabular}
+\caption{E1: final TTA test accuracy by solver.}
+\end{table}
+
+\subsection{E2: Rank Sweep}
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E2_rank_val_loss.png}
+\caption{Validation loss}
+\end{subfigure}
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E2_rank_train_loss.png}
+\caption{Training loss}
+\end{subfigure}
+\caption{E2: validation and training loss by rank.}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Rank} & \textbf{Test accuracy (mean $\pm$ std)} \\
+\midrule
+rank = 16   & $0.9068 \pm 0.0014$ \\
+rank = 32   & $0.9180 \pm 0.0014$ \\
+rank = 64   & $0.9284 \pm 0.0015$ \\
+rank = 128  & $0.9357 \pm 0.0014$ \\
+\textbf{rank = 256}  & $\mathbf{0.9381 \pm 0.0014}$ \\
+\bottomrule
+\end{tabular}
+\caption{E2: final TTA test accuracy by rank.}
+\end{table}
+
+\subsection{E3: NS-Step Sweep}
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E3_NS_step_val_loss.png}
+\caption{Validation loss}
+\end{subfigure}
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E3_NS_step_train_loss.png}
+\caption{Training loss}
+\end{subfigure}
+\caption{E3: validation and training loss by NS iterations.}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{NS iterations} & \textbf{Test accuracy (mean $\pm$ std)} \\
+\midrule
+$q = 1$  & $0.8940 \pm 0.0019$ \\
+$q = 3$  & $0.9165 \pm 0.0013$ \\
+$q = 5$  & $0.9296 \pm 0.0016$ \\
+$q = 7$  & $0.9362 \pm 0.0012$ \\
+$\mathbf{q = 9}$  & $\mathbf{0.9386 \pm 0.0015}$ \\
+\bottomrule
+\end{tabular}
+\caption{E3: final TTA test accuracy by NS iterations.}
+\end{table}
+
+\subsection{E4: Batch-Size Sweep}
+
+\begin{figure}[ht]
+\centering
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E4_batch_size_val_loss.png}
+\caption{Validation loss}
+\end{subfigure}
+\begin{subfigure}[b]{0.49\linewidth}
+\includegraphics[width=\linewidth]{\resultdir/Ablation_E4_batch_size_train_loss.png}
+\caption{Training loss}
+\end{subfigure}
+\caption{E4: validation and training loss by batch size.}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Batch size} & \textbf{Test accuracy (mean $\pm$ std)} \\
+\midrule
+$B = 500$   & $0.9373 \pm 0.0013$ \\
+$\mathbf{B = 1000}$  & $\mathbf{0.9386 \pm 0.0016}$ \\
+$B = 2000$  & $0.9339 \pm 0.0015$ \\
+$B = 3000$  & $0.9272 \pm 0.0022$ \\
+$B = 4000$  & $0.9120 \pm 0.0047$ \\
+\bottomrule
+\end{tabular}
+\caption{E4: final TTA test accuracy by batch size.}
+\end{table}
 
 
 \end{document}

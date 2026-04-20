@@ -1,0 +1,59 @@
+# AdamW baseline sweep (E5 row 1: every parameter routed through Adam every step).
+program: train_gpt.py
+entity: xjc5161-penn-state
+project: adamw-nanogpt
+method: bayes
+metric:
+  name: final_val_loss
+  goal: minimize
+parameters:
+  adamw_lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  seq_len:
+    values: [1024, 2048, 4096]
+command:
+  - ${env}
+  - torchrun
+  - --standalone
+  - --nproc_per_node=8
+  - ${program}
+  # --- General ---
+  - --optimizer-mode
+  - adamw
+  - --num-trials
+  - "1"
+  - --log-every
+  - "50"
+  - --wandb
+  - "True"
+  - --wandb-project
+  - adamw-nanogpt
+  # --- SGD (unused) ---
+  - --sgd-momentum
+  - "0.95"
+  - --sgd-nesterov
+  - "True"
+  # --- Muon (unused) ---
+  - --muon-lr
+  - "0.023"
+  - --muon-momentum
+  - "0.95"
+  - --muon-nesterov
+  - "True"
+  # --- Randomized solver (unused) ---
+  - --randomized
+  - "False"
+  - --rank
+  - "100"
+  - --oversampling
+  - "10"
+  - --power-iters
+  - "0"
+  - --orth-steps
+  - "5"
+  - --inexact-solver
+  - "polar_express"
+  # --- Swept via ${args}: adamw_lr, seq_len ---
+  - ${args}

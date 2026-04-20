@@ -1,0 +1,65 @@
+# Muon (Polyak momentum, full Newton-Schulz) sweep.
+program: train_gpt.py
+entity: xjc5161-penn-state
+project: muon-polyak-full-nanogpt
+method: bayes
+metric:
+  name: final_val_loss
+  goal: minimize
+parameters:
+  muon_lr:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.1
+  muon_momentum:
+    distribution: uniform
+    min: 0.80
+    max: 0.98
+  inexact_solver:
+    values:
+      - cubic
+      - quintic_theoretical
+      - quintic_empirical
+      - polar_express
+  orth_steps:
+    values: [1, 3, 5, 7, 9]
+  seq_len:
+    values: [1024, 2048, 4096]
+command:
+  - ${env}
+  - torchrun
+  - --standalone
+  - --nproc_per_node=8
+  - ${program}
+  # --- General ---
+  - --optimizer-mode
+  - muon
+  - --num-trials
+  - "1"
+  - --log-every
+  - "50"
+  - --wandb
+  - "True"
+  - --wandb-project
+  - muon-polyak-full-nanogpt
+  # --- Muon (Polyak: muon-nesterov=False) ---
+  - --muon-nesterov
+  - "False"
+  # --- SGD / AdamW (unused in muon mode) ---
+  - --sgd-momentum
+  - "0.95"
+  - --sgd-nesterov
+  - "True"
+  - --adamw-lr
+  - "0.001"
+  # --- Solver: full NS (randomized=False) ---
+  - --randomized
+  - "False"
+  - --rank
+  - "100"
+  - --oversampling
+  - "10"
+  - --power-iters
+  - "0"
+  # --- Swept via ${args}: muon_lr, muon_momentum, inexact_solver, orth_steps, seq_len ---
+  - ${args}

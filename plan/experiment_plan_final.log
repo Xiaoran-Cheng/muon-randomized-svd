@@ -1,10 +1,10 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.24 (MiKTeX 23.1) (preloaded format=pdflatex 2026.3.5)  13 APR 2026 11:20
+This is pdfTeX, Version 3.141592653-2.6-1.40.24 (MiKTeX 23.1) (preloaded format=pdflatex 2026.3.5)  19 APR 2026 23:30
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
  %&-line parsing enabled.
-**"c:/Users/22797/OneDrive/桌面/heavy tail muon/experiment_plan_final.tex"
-(c:/Users/22797/OneDrive/桌面/heavy tail muon/experiment_plan_final.tex
+**"c:/Users/22797/OneDrive/桌面/heavy tail muon/plan/experiment_plan_final.tex"
+(c:/Users/22797/OneDrive/桌面/heavy tail muon/plan/experiment_plan_final.tex
 LaTeX2e <2025-11-01>
 L3 programming layer <2026-01-19>
 (D:\Software\MiKTeX\tex/latex/base\article.cls
@@ -281,30 +281,67 @@ Package xcolor Info: Model `tHsb' substituted by `hsb' on input line 1369.
 Package xcolor Info: Model `HSB' substituted by `hsb' on input line 1370.
 Package xcolor Info: Model `Gray' substituted by `gray' on input line 1371.
 Package xcolor Info: Model `wave' substituted by `hsb' on input line 1372.
+) (D:\Software\MiKTeX\tex/latex/graphics\graphicx.sty
+Package: graphicx 2024/12/31 v1.2e Enhanced LaTeX Graphics (DPC,SPQR)
+ (D:\Software\MiKTeX\tex/latex/graphics\graphics.sty
+Package: graphics 2024/08/06 v1.4g Standard LaTeX Graphics (DPC,SPQR)
+ (D:\Software\MiKTeX\tex/latex/graphics\trig.sty
+Package: trig 2023/12/02 v1.11 sin cos tan (DPC)
+) (D:\Software\MiKTeX\tex/latex/graphics-cfg\graphics.cfg
+File: graphics.cfg 2016/06/04 v1.11 sample graphics configuration
+)
+Package graphics Info: Driver file: pdftex.def on input line 106.
+)
+\Gin@req@height=\dimen186
+\Gin@req@width=\dimen187
+) (D:\Software\MiKTeX\tex/latex/caption\subcaption.sty
+Package: subcaption 2023/07/28 v1.6b Sub-captions (AR)
+ (D:\Software\MiKTeX\tex/latex/caption\caption.sty
+Package: caption 2023/08/05 v3.6o Customizing captions (AR)
+ (D:\Software\MiKTeX\tex/latex/caption\caption3.sty
+Package: caption3 2023/07/31 v2.4d caption3 kernel (AR)
+\caption@tempdima=\dimen188
+\captionmargin=\dimen189
+\caption@leftmargin=\dimen190
+\caption@rightmargin=\dimen191
+\caption@width=\dimen192
+\caption@indent=\dimen193
+\caption@parindent=\dimen194
+\caption@hangindent=\dimen195
+Package caption Info: Standard document class detected.
+)
+\c@caption@flags=\count316
+\c@continuedfloat=\count317
+Package caption Info: hyperref package is loaded.
+)
+Package caption Info: New subtype `subfigure' on input line 238.
+\c@subfigure=\count318
+Package caption Info: New subtype `subtable' on input line 238.
+\c@subtable=\count319
 ) (D:\Software\MiKTeX\tex/latex/l3backend\l3backend-pdftex.def
 File: l3backend-pdftex.def 2025-10-09 L3 backend support: PDF output (pdfTeX)
-\l__color_backend_stack_int=\count316
+\l__color_backend_stack_int=\count320
 ) (experiment_plan_final.aux)
 \openout1 = `experiment_plan_final.aux'.
 
-LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
-LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 15.
-LaTeX Font Info:    ... okay on input line 15.
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
+LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 17.
+LaTeX Font Info:    ... okay on input line 17.
 
 *geometry* driver: auto-detecting
 *geometry* detected driver: pdftex
@@ -340,30 +377,37 @@ LaTeX Font Info:    ... okay on input line 15.
 * \@reversemarginfalse
 * (1in=72.27pt=25.4mm, 1cm=28.453pt)
 
-Package hyperref Info: Link coloring OFF on input line 15.
+Package hyperref Info: Link coloring OFF on input line 17.
 (experiment_plan_final.out) (experiment_plan_final.out)
 \@outlinefile=\write3
 \openout3 = `experiment_plan_final.out'.
 
  (D:\Software\MiKTeX\tex/context/base/mkii\supp-pdf.mkii
 [Loading MPS to PDF converter (version 2006.09.02).]
-\scratchcounter=\count317
-\scratchdimen=\dimen186
+\scratchcounter=\count321
+\scratchdimen=\dimen196
 \scratchbox=\box58
-\nofMPsegments=\count318
-\nofMParguments=\count319
+\nofMPsegments=\count322
+\nofMParguments=\count323
 \everyMPshowfont=\toks32
-\MPscratchCnt=\count320
-\MPscratchDim=\dimen187
-\MPnumerator=\count321
-\makeMPintoPDFobject=\count322
+\MPscratchCnt=\count324
+\MPscratchDim=\dimen197
+\MPnumerator=\count325
+\makeMPintoPDFobject=\count326
 \everyMPtoPDFconversion=\toks33
-)
-LaTeX Font Info:    Trying to load font information for U+msa on input line 17.
+) (D:\Software\MiKTeX\tex/latex/epstopdf-pkg\epstopdf-base.sty
+Package: epstopdf-base 2020-01-24 v2.11 Base part for package epstopdf
+Package epstopdf-base Info: Redefining graphics rule for `.eps' on input line 485.
+ (D:\Software\MiKTeX\tex/latex/00miktex\epstopdf-sys.cfg
+File: epstopdf-sys.cfg 2021/03/18 v2.0 Configuration of epstopdf for MiKTeX
+))
+Package caption Info: Begin \AtBeginDocument code.
+Package caption Info: End \AtBeginDocument code.
+LaTeX Font Info:    Trying to load font information for U+msa on input line 19.
  (D:\Software\MiKTeX\tex/latex/amsfonts\umsa.fd
 File: umsa.fd 2013/01/14 v3.01 AMS symbols A
 )
-LaTeX Font Info:    Trying to load font information for U+msb on input line 17.
+LaTeX Font Info:    Trying to load font information for U+msb on input line 19.
  (D:\Software\MiKTeX\tex/latex/amsfonts\umsb.fd
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )
@@ -373,34 +417,92 @@ File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 {C:/Users/22797/AppData/Local/MiKTeX/fonts/map/pdftex/pdftex.map}]
 
 [2]
-Overfull \hbox (51.50279pt too wide) in paragraph at lines 133--134
+Overfull \hbox (51.50279pt too wide) in paragraph at lines 135--136
 []\OT1/cmr/m/n/10.95 Sweep batch sizes $\OML/cmm/m/it/10.95 B \OMS/cmsy/m/n/10.95 2 f\OT1/cmr/m/n/10.95 500\OML/cmm/m/it/10.95 ;  \OT1/cmr/m/n/10.95 1000\OML/cmm/m/it/10.95 ;  \OT1/cmr/m/n/10.95 2000\OML/cmm/m/it/10.95 ; \OT1/cmr/m/n/10.95 3000\OML/cmm/m/it/10.95 ; \OT1/cmr/m/n/10.95 4000\OMS/cmsy/m/n/10.95 g$ \OT1/cmr/m/n/10.95 for CIFAR-10 and $\OML/cmm/m/it/10.95 B \OMS/cmsy/m/n/10.95 2 f\OT1/cmr/m/n/10.95 256\OML/cmm/m/it/10.95 ;  \OT1/cmr/m/n/10.95 512\OML/cmm/m/it/10.95 ;  \OT1/cmr/m/n/10.95 1024\OML/cmm/m/it/10.95 ; \OT1/cmr/m/n/10.95 2048\OML/cmm/m/it/10.95 ; \OT1/cmr/m/n/10.95 4096\OMS/cmsy/m/n/10.95 g$
  []
 
 
 
 [3]
+<../muon-randomized-svd/cifar10/experiment_result/E5_val_loss.png, id=165, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/E5_val_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/E5_val_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/E5_val_loss.png  used on input line 254.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/E5_train_loss.png, id=167, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/E5_train_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/E5_train_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/E5_train_loss.png  used on input line 258.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
 
-[4] (experiment_plan_final.aux)
+
+[4]
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_val_loss.png, id=181, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_val_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_val_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_val_loss.png  used on input line 286.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_train_loss.png, id=182, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_train_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_train_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_train_loss.png  used on input line 290.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_val_loss.png, id=183, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_val_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_val_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_val_loss.png  used on input line 316.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_train_loss.png, id=184, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_train_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_train_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_train_loss.png  used on input line 320.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_val_loss.png, id=185, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_val_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_val_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_val_loss.png  used on input line 347.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_train_loss.png, id=186, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_train_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_train_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_train_loss.png  used on input line 351.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_val_loss.png, id=187, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_val_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_val_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_val_loss.png  used on input line 378.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+<../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_train_loss.png, id=188, 505.89pt x 325.215pt>
+File: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_train_loss.png Graphic file (type png)
+<use ../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_train_loss.png>
+Package pdftex.def Info: ../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_train_loss.png  used on input line 382.
+(pdftex.def)             Requested size: 230.18253pt x 147.97801pt.
+
+
+[5 <../muon-randomized-svd/cifar10/experiment_result/E5_val_loss.png> <../muon-randomized-svd/cifar10/experiment_result/E5_train_loss.png>]
+
+[6 <../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_val_loss.png> <../muon-randomized-svd/cifar10/experiment_result/Ablation_E1_solvers_train_loss.png> <../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_val_loss.png> <../muon-randomized-svd/cifar10/experiment_result/Ablation_E2_rank_train_loss.png>]
+
+[7 <../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_val_loss.png> <../muon-randomized-svd/cifar10/experiment_result/Ablation_E3_NS_step_train_loss.png> <../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_val_loss.png> <../muon-randomized-svd/cifar10/experiment_result/Ablation_E4_batch_size_train_loss.png>] (experiment_plan_final.aux)
  ***********
 LaTeX2e <2025-11-01>
 L3 programming layer <2026-01-19>
  ***********
 Package rerunfilecheck Info: File `experiment_plan_final.out' has not changed.
-(rerunfilecheck)             Checksum: 7BADA3C829F1D06E5A78FCD22D2C68CC;3144.
+(rerunfilecheck)             Checksum: 25BC62FBA61D1FCE6AE70E9EC13A4EA6;4127.
  ) 
 Here is how much of TeX's memory you used:
- 10847 strings out of 467864
- 161731 string characters out of 5430849
- 595292 words of memory out of 5000000
- 39566 multiletter control sequences out of 15000+600000
- 635774 words of font info for 70 fonts, out of 8000000 for 9000
+ 12749 strings out of 467864
+ 201830 string characters out of 5430849
+ 628001 words of memory out of 5000000
+ 41414 multiletter control sequences out of 15000+600000
+ 636395 words of font info for 72 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,11n,79p,613b,581s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,11n,79p,618b,581s stack positions out of 10000i,1000n,20000p,200000b,200000s
  <C:\Users\22797\AppData\Local\MiKTeX\fonts/pk/ljfour/jknappen/ec/dpi600\tcrm1095.pk><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmbx10.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmbx12.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmmi10.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmmi8.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmr10.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmr17.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmr8.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy10.pfb><D:/Software/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy8.pfb>
-Output written on experiment_plan_final.pdf (4 pages, 148648 bytes).
+Output written on experiment_plan_final.pdf (7 pages, 970101 bytes).
 PDF statistics:
- 205 PDF objects out of 1000 (max. 8388607)
- 53 named destinations out of 1000 (max. 500000)
- 193 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 284 PDF objects out of 1000 (max. 8388607)
+ 77 named destinations out of 1000 (max. 500000)
+ 291 words of extra memory for PDF output out of 10000 (max. 10000000)
 

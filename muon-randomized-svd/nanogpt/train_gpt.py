@@ -1884,6 +1884,7 @@ class Hyperparameters:
     muon_nesterov: bool  = True        # True → Nesterov; False → Polyak (mirrors --muon-nesterov)
     rank:          int   = 0           # 0 → fall back to rank_ratio; otherwise absolute rank
     seed_base:     int   = 0           # trial_id is added to this for per-trial fresh init
+    seq_len:       int   = 2048        # middle factor in batch_size = N*seq_len*world_size (curriculum-uniform)
     cli_args_dict: dict  = field(default_factory=dict)   # snapshot of parsed argparse values, for folder naming
 
 
@@ -1926,9 +1927,21 @@ def _build_cli_parser():
                    help="Absolute target rank k for randomized projection. 0 = fall back to rank_ratio semantics.")
     p.add_argument("--oversampling", type=int, default=None)
     p.add_argument("--power-iters", "--power_iters", type=int, default=None)
+    # Batch schedule knob: middle factor in batch_size = N * seq_len * world_size (scales uniformly across stages)
+    p.add_argument("--seq-len", "--seq_len", type=int, default=2048,
+                   help="Middle factor of batch_size formula (uniformly scales total batch across all curriculum stages).")
     # Output dir / logging
     p.add_argument("--log-root", "--log_root", type=str, default="Logs",
                    help="Root directory for per-run pkl outputs (default: Logs/).")
+    # W&B (each trial is its own wandb run; sweep agents override other flags via --${args})
+    p.add_argument("--wandb", type=_parse_bool_cli, default=False,
+                   help="Enable Weights & Biases logging (master rank only).")
+    p.add_argument("--wandb-project", "--wandb_project", type=str, default="muon-nanogpt",
+                   help="W&B project name (ignored inside a sweep agent; sweep's project wins).")
+    p.add_argument("--wandb-group", "--wandb_group", type=str, default=None,
+                   help="W&B group name; defaults to output_dir basename when unset.")
+    p.add_argument("--wandb-entity", "--wandb_entity", type=str, default=None,
+                   help="W&B entity (team/user). None → use wandb default.")
     return p
 
 
@@ -1968,6 +1981,7 @@ def _merge_cli_into_args(args: Hyperparameters, cli_args: argparse.Namespace) ->
     args.log_every      = cli_args.log_every
     # args.rank (absolute). 0 → keep using rank_ratio in _build_param_cfg.
     args.rank           = cli_args.rank
+    args.seq_len        = cli_args.seq_len
     # Snapshot for folder naming later.
     args.cli_args_dict  = vars(cli_args)
     # --log-every also overrides val_loss cadence.
@@ -1986,6 +2000,7 @@ ARG_ABBREVIATIONS = {
     "optimizer_mode":  "om",
     "num_trials":      "nt",
     "log_every":       "le",
+    "seq_len":         "sl",
     "inexact_solver":  "is",
     "orth_steps":      "os",
     "randomized":      "rz",
@@ -2007,15 +2022,15 @@ MODE_FOLDER_ARGS = {
         "muon_lr", "muon_momentum", "muon_nesterov",
         "inexact_solver", "orth_steps",
         "randomized", "rank", "oversampling", "power_iters",
-        "num_trials", "log_every",
+        "seq_len", "num_trials", "log_every",
     ],
     "sgd_nesterov": [
         "sgd_lr", "sgd_momentum", "sgd_nesterov",
-        "num_trials", "log_every",
+        "seq_len", "num_trials", "log_every",
     ],
     "adamw": [
         "adamw_lr",
-        "num_trials", "log_every",
+        "seq_len", "num_trials", "log_every",
     ],
 }
 
@@ -2111,16 +2126,19 @@ class TrainingSchedule:
             lr = lr * (1 - t) + 0.15 * t
         return lr
 
-# window_sizes are in units of `block_size` tokens (defined in TrainingManager)
+# window_sizes are in units of `block_size` tokens (defined in TrainingManager).
+# batch_size middle factor = args.seq_len (CLI --seq-len, default 2048). Changing
+# --seq-len uniformly scales total batch across all stages while preserving
+# inter-stage ratios (1:2:3), so the hand-tuned lr_mul exponents still apply.
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * args.seq_len * 8, window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * args.seq_len * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * args.seq_len * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(train_max_seq_len=2048, batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=24 * args.seq_len * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
@@ -2468,6 +2486,20 @@ model.train()
 train_steps = training_schedule.total_steps
 trial_outputs: list[dict] = []
 
+# Build output_dir once up front so wandb's dir/group and the final pkl share it.
+output_dir = build_output_dir(args, cli_args)
+if master_process:
+    os.makedirs(output_dir, exist_ok=True)
+
+# Lazy import: avoid hard dep on wandb when --wandb is False or unavailable.
+use_wandb = bool(args.cli_args_dict.get("wandb", False)) and master_process
+wandb = None
+if use_wandb:
+    import wandb as _wandb
+    wandb = _wandb
+    wandb_parent_dir = os.path.dirname(output_dir) or "."
+    os.makedirs(wandb_parent_dir, exist_ok=True)
+
 for trial_id in range(args.num_trials):
     print0(f"========== Trial {trial_id + 1}/{args.num_trials} ==========", console=True)
     # Restore model + optimizer to post-warmup initial state (same weights every trial;
@@ -2477,6 +2509,17 @@ for trial_id in range(args.num_trials):
         model.load_state_dict(initial_state["model"])
         training_manager.reset(initial_state["optimizer"])
         model.train()
+
+    if use_wandb:
+        wandb.init(
+            project=cli_args.wandb_project,
+            entity=cli_args.wandb_entity,
+            config=vars(cli_args),
+            group=(cli_args.wandb_group or os.path.basename(output_dir))[:128],
+            name=f"trial_{trial_id:03d}",
+            reinit=True,
+            dir=wandb_parent_dir,
+        )
 
     train_loader = distributed_data_generator(
         args.train_files,
@@ -2520,6 +2563,8 @@ for trial_id in range(args.num_trials):
             val_loss_scalar = float(val_loss.item())
             val_loss_records.append((step, val_loss_scalar))
             print0(f"[trial {trial_id + 1}] step:{step}/{train_steps} val_loss:{val_loss_scalar:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            if use_wandb:
+                wandb.log({"val_loss": val_loss_scalar, "step": step})
             model.train()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -2543,7 +2588,10 @@ for trial_id in range(args.num_trials):
             del loss
         training_manager.step_optimizers(step)
         dist.reduce(train_loss_accum, 0, op=dist.ReduceOp.AVG)
-        train_losses.append(float(train_loss_accum.item()))
+        step_train_loss = float(train_loss_accum.item())
+        train_losses.append(step_train_loss)
+        if use_wandb:
+            wandb.log({"train_loss": step_train_loss, "step": step})
 
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
@@ -2553,6 +2601,10 @@ for trial_id in range(args.num_trials):
         "train_losses": train_losses,
         "val_loss_records": val_loss_records,
     })
+    if use_wandb:
+        if val_loss_records:
+            wandb.log({"final_val_loss": val_loss_records[-1][1]})
+        wandb.finish()
     del train_loader
     gc.collect()
     torch.cuda.empty_cache()
@@ -2561,9 +2613,7 @@ for trial_id in range(args.num_trials):
 #           Save losses to pkl         #
 ########################################
 if master_process and len(trial_outputs) > 0:
-    output_dir = build_output_dir(args, cli_args)
-    os.makedirs(output_dir, exist_ok=True)
-
+    # output_dir already built and created before the trial loop.
     # Aligned val-step axis (all trials share the same cadence, verified below).
     val_steps_ref = [s for (s, _) in trial_outputs[0]["val_loss_records"]]
     for out in trial_outputs:

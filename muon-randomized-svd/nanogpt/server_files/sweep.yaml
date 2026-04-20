@@ -1,0 +1,67 @@
+# Bayesian sweep over key Muon hyperparameters (randomized NS + Nesterov momentum).
+# Usage:
+#   wandb sweep muon-randomized-svd/nanogpt/sweep.yaml
+#   wandb agent <sweep_id>            # run on a machine with 8 GPUs
+#
+# Each agent invocation runs one trial (num-trials=1) — the Bayesian controller
+# picks the next hyperparameter combination using the minimised metric below.
+
+program: train_gpt.py
+entity: xjc5161-penn-state
+project: muon-nanogpt
+method: bayes
+metric:
+  name: final_val_loss
+  goal: minimize
+
+parameters:
+  inexact_solver:
+    values:
+      - cubic
+      - quintic_theoretical
+      - quintic_empirical
+      - polar_express
+  rank:
+    values: [50, 100, 150, 200, 300]
+  orth_steps:
+    values: [1, 3, 5, 7]
+  muon_lr:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.1
+  muon_momentum:
+    distribution: uniform
+    min: 0.80
+    max: 0.98
+  power_iters:
+    values: [0, 1, 2, 3]
+  seq_len:
+    values: [1024, 2048, 4096]
+
+command:
+  - ${env}
+  - torchrun
+  - --standalone
+  - --nproc_per_node=8
+  - ${program}
+  # --- General ---
+  - --optimizer-mode
+  - muon
+  - --num-trials
+  - "1"
+  - --log-every
+  - "50"
+  - --wandb
+  - "True"
+  - --wandb-project
+  - muon-nanogpt
+  # --- Muon fixed ---
+  - --muon-nesterov
+  - "True"
+  # --- Randomized solver fixed ---
+  - --randomized
+  - "True"
+  - --oversampling
+  - "10"
+  # --- Swept via ${args}: inexact_solver, rank, orth_steps, muon_lr, muon_momentum, power_iters, seq_len ---
+  - ${args}
