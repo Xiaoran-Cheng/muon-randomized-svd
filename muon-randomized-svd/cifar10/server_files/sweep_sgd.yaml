@@ -33,7 +33,7 @@ command:
   - --wandb-project
   - sgd-nesterov
   - --batch-size
-  - "1000"
+  - "500"
   # --- SGD (swept + fixed) ---
   - --sgd-nesterov
   - "True"

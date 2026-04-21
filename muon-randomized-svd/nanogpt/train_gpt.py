@@ -40,7 +40,19 @@ from torch import Tensor, nn
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+# The fused kernel uses TMA descriptors (Hopper-only). On A100 / earlier GPUs,
+# fall back to an eager PyTorch implementation so the script still runs.
+_device_cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+if _device_cap[0] >= 9:
+    ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+else:
+    def ReLUSqrdMLP(x, W1, W2):
+        orig_shape = x.shape
+        x_flat = x.view(-1, x.shape[-1])
+        pre = F.linear(x_flat, W1)
+        post = F.relu(pre).pow(2)
+        x3 = post @ W2
+        return x3.view(orig_shape[:-1] + (W2.shape[-1],))
 
 dynamo.config.recompile_limit = 64
 
@@ -1354,7 +1366,26 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+# Attention backend selection (3 tiers of fallback):
+#   1. FA3 kernel via HuggingFace `kernels` library (H100 fast path)
+#   2. FA2 via `flash-attn` pip package (Ampere-compatible)
+#   3. xformers memory_efficient_attention (cu11/cu12, manylinux2014 glibc)
+try:
+    flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+    _fa_varlen_func = flash_attn_interface.flash_attn_varlen_func
+    _FA_BACKEND = "fa3"
+except Exception:
+    try:
+        from flash_attn import flash_attn_varlen_func as _fa_varlen_func
+        _FA_BACKEND = "fa2"
+    except Exception:
+        import xformers.ops as _xops
+        from xformers.ops.fmha.attn_bias import (
+            BlockDiagonalCausalMask as _BlockDiagonalCausalMask,
+            BlockDiagonalCausalLocalAttentionMask as _BlockDiagonalCausalLocalAttentionMask,
+        )
+        _fa_varlen_func = None
+        _FA_BACKEND = "xformers"
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1418,10 +1449,26 @@ class CausalSelfAttention(nn.Module):
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng.
+        # bm_size=None means "full attention" on this layer.
+        if _FA_BACKEND == "xformers":
+            # xformers path: build block-diagonal mask from per-sequence lengths.
+            # .tolist() forces a CPU sync; acceptable for smoke tests but breaks
+            # fullgraph compile (use DISABLE_COMPILE=1 env var if compile errors).
+            seqlens_list = seqlens.diff().tolist() if seqlens.dim() == 1 else seqlens.tolist()
+            attn_bias = _BlockDiagonalCausalMask.from_seqlens(q_seqlen=seqlens_list)
+            if bm_size is not None:
+                # Convert causal mask into a sliding-window (local) causal mask.
+                attn_bias = attn_bias.make_local_attention(int(bm_size) + 1)
+            y = _xops.memory_efficient_attention(
+                q[0].unsqueeze(0), k[0].unsqueeze(0), v[0].unsqueeze(0),
+                attn_bias=attn_bias, scale=yarn.attn_scale,
+            ).squeeze(0)
+        else:
+            _win = (bm_size, 0) if bm_size is not None else (-1, -1)
+            y = _fa_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                causal=True, softmax_scale=yarn.attn_scale, window_size=_win)
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1533,7 +1580,7 @@ class GPT(nn.Module):
                     *[torch.tensor([0.5, 1.0]) for _ in range(num_layers)],  # SA lambdas
                     torch.zeros(1), # smear_lambda
                     0.5*torch.ones(1), # backout_lambda
-                    -1.5 * torch.ones(1),  # skip_lambda -> σ(-1.5) ≈ 0.18
+                    -1.5 * torch.ones(1),  # skip_lambda -> Ïƒ(-1.5) â‰ˆ 0.18
                     torch.ones(pad),
                 ]
             )
@@ -1642,7 +1689,7 @@ class GPT(nn.Module):
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        if self.training:
+        if self.training and self.lm_head.use_fp8:
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s)
         else:
             logits = self.lm_head(x)
@@ -1842,12 +1889,12 @@ class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", ".")
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
-    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = int(os.environ.get("SMOKE_VAL_TOKENS_TOTAL", 10485760)) # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = int(os.environ.get("SMOKE_VAL_TOKENS", 4 * 64 * 1024 * 8))
     # schedule
-    num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = int(os.environ.get("NUM_ITERATIONS", 1450))  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = int(os.environ.get("NUM_EXT_ITERATIONS", 40))  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1881,8 +1928,8 @@ class Hyperparameters:
     sgd_nesterov:  bool  = True
     muon_lr:       float = 0.023       # matches current normuon_defaults["lr"]
     muon_momentum: float = 0.95        # peak value of the Muon momentum warmup
-    muon_nesterov: bool  = True        # True → Nesterov; False → Polyak (mirrors --muon-nesterov)
-    rank:          int   = 0           # 0 → fall back to rank_ratio; otherwise absolute rank
+    muon_nesterov: bool  = True        # True â†’ Nesterov; False â†’ Polyak (mirrors --muon-nesterov)
+    rank:          int   = 0           # 0 â†’ fall back to rank_ratio; otherwise absolute rank
     seed_base:     int   = 0           # trial_id is added to this for per-trial fresh init
     seq_len:       int   = 2048        # middle factor in batch_size = N*seq_len*world_size (curriculum-uniform)
     cli_args_dict: dict  = field(default_factory=dict)   # snapshot of parsed argparse values, for folder naming
@@ -1941,7 +1988,7 @@ def _build_cli_parser():
     p.add_argument("--wandb-group", "--wandb_group", type=str, default=None,
                    help="W&B group name; defaults to output_dir basename when unset.")
     p.add_argument("--wandb-entity", "--wandb_entity", type=str, default=None,
-                   help="W&B entity (team/user). None → use wandb default.")
+                   help="W&B entity (team/user). None â†’ use wandb default.")
     return p
 
 
@@ -1979,7 +2026,7 @@ def _merge_cli_into_args(args: Hyperparameters, cli_args: argparse.Namespace) ->
     args.sgd_nesterov   = cli_args.sgd_nesterov
     args.num_trials     = cli_args.num_trials
     args.log_every      = cli_args.log_every
-    # args.rank (absolute). 0 → keep using rank_ratio in _build_param_cfg.
+    # args.rank (absolute). 0 â†’ keep using rank_ratio in _build_param_cfg.
     args.rank           = cli_args.rank
     args.seq_len        = cli_args.seq_len
     # Snapshot for folder naming later.
@@ -1994,7 +2041,7 @@ _merge_cli_into_args(args, cli_args)
 # -----------------------------------------------------------------------------
 # Output directory naming (mirrors cifar10/airbench94_muon.py convention).
 # Folder layout:  {log_root}/{optimizer_mode}/{abbrev1}{val1}_{abbrev2}{val2}.../
-# Contents:       losses.pkl  (train/val loss tables across trials)
+# Contents:       losses.pkl  (train/val loss + cumulative training time tables across trials)
 # -----------------------------------------------------------------------------
 ARG_ABBREVIATIONS = {
     "optimizer_mode":  "om",
@@ -2142,6 +2189,9 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
+
+
+
 # TODO - Confirm.
 training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
@@ -2248,7 +2298,7 @@ class TrainingManager():
             ns_steps=args.ns_steps,
             use_randomized=args.use_randomized,
             rank_ratio=args.rank_ratio,
-            rank_abs=args.rank,                  # 0 → use rank_ratio; >0 → absolute rank
+            rank_abs=args.rank,                  # 0 â†’ use rank_ratio; >0 â†’ absolute rank
             oversampling=args.oversampling,
             power_iter=args.power_iter,
             momentum_type=args.momentum_type,
@@ -2439,7 +2489,13 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+if os.environ.get("DISABLE_COMPILE", "0") == "1":
+    print0("DISABLE_COMPILE=1 â†’ skipping torch.compile (smoke-test mode)", console=True)
+elif _FA_BACKEND == "xformers":
+    # xformers mask creation does .tolist() which breaks fullgraph; drop fullgraph.
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=False)
+else:
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 
@@ -2530,6 +2586,7 @@ for trial_id in range(args.num_trials):
     gc.collect()
 
     train_losses: list[float] = []     # one entry per training step (length == train_steps)
+    train_times_ms: list[float] = []   # cumulative training time (ms) after each step, aligned with train_losses
     val_loss_records: list[tuple[int, float]] = []   # (step, val_loss) pairs
 
     training_time_ms = 0
@@ -2594,12 +2651,15 @@ for trial_id in range(args.num_trials):
             wandb.log({"train_loss": step_train_loss, "step": step})
 
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        train_times_ms.append(approx_training_time_ms)
         print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
     trial_outputs.append({
         "trial_id": trial_id,
         "train_losses": train_losses,
+        "train_times_ms": train_times_ms,
         "val_loss_records": val_loss_records,
+        "total_training_time_ms": training_time_ms,
     })
     if use_wandb:
         if val_loss_records:
@@ -2624,24 +2684,33 @@ if master_process and len(trial_outputs) > 0:
     num_trials_run = len(trial_outputs)
 
     train_columns, train_values = [], []
+    train_time_columns, train_time_values_ms = [], []
     val_columns, val_values = [], []
+    total_training_time_ms_per_trial = []
     for t_idx, out in enumerate(trial_outputs):
         train_columns.append(f"trial_{t_idx:03d}_train_loss")
         train_values.append(out["train_losses"])
+        train_time_columns.append(f"trial_{t_idx:03d}_train_time_ms")
+        train_time_values_ms.append(out["train_times_ms"])
         val_columns.append(f"trial_{t_idx:03d}_val_loss")
         val_values.append([v for (_, v) in out["val_loss_records"]])
+        total_training_time_ms_per_trial.append(out["total_training_time_ms"])
 
     # Transpose so each column corresponds to one trial (rows = step axis).
-    train_values_t = list(map(list, zip(*train_values))) if train_values else []
-    val_values_t   = list(map(list, zip(*val_values)))   if val_values   else []
+    train_values_t         = list(map(list, zip(*train_values)))         if train_values         else []
+    train_time_values_t_ms = list(map(list, zip(*train_time_values_ms))) if train_time_values_ms else []
+    val_values_t           = list(map(list, zip(*val_values)))           if val_values           else []
 
     payload = {
         "train_steps": train_step_axis,
         "train_columns": train_columns,
         "train_values": train_values_t,
+        "train_time_columns": train_time_columns,
+        "train_time_values_ms": train_time_values_t_ms,
         "val_steps": val_steps_ref,
         "val_columns": val_columns,
         "val_values": val_values_t,
+        "total_training_time_ms": total_training_time_ms_per_trial,
         "args": vars(cli_args),
         "num_trials": num_trials_run,
     }

@@ -861,6 +861,7 @@ def main(run, model, optimizer_mode, orth_method, orth_steps, batch_size, epochs
         "train_accs": train_accs,
         "final_val_acc": tta_val_acc,
         "final_test_acc": tta_test_acc,
+        "time_seconds": time_seconds,
     }
 
 if __name__ == "__main__":
@@ -1185,10 +1186,11 @@ if __name__ == "__main__":
 
     val_accs_final = torch.tensor([out["final_val_acc"] for out in trial_outputs], dtype=torch.float32)
     test_accs_final = torch.tensor([out["final_test_acc"] for out in trial_outputs], dtype=torch.float32)
+    time_seconds_all = torch.tensor([out["time_seconds"] for out in trial_outputs], dtype=torch.float32)
     accuracy_payload = {
         "rows": [f"trial_{i:03d}" for i in range(len(trial_outputs))],
-        "columns": ["val_acc_tta2", "test_acc_tta2"],
-        "values": torch.stack([val_accs_final, test_accs_final], dim=1),
+        "columns": ["val_acc_tta2", "test_acc_tta2", "time_seconds"],
+        "values": torch.stack([val_accs_final, test_accs_final, time_seconds_all], dim=1),
     }
     accuracy_path = os.path.join(output_dir, "accuracy.pkl")
     with open(accuracy_path, "wb") as f:

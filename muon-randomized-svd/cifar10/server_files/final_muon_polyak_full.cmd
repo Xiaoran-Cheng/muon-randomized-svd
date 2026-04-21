@@ -13,4 +13,7 @@ request_memory = 30GB
 requirements = (Machine == "isye-hpc0456.isye.gatech.edu") || \
                (Machine == "isye-hpc0458.isye.gatech.edu")
 
+notification = Always
+notify_user = xjc5161@psu.edu
+
 queue

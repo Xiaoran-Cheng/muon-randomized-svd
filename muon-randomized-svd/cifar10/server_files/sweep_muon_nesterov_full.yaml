@@ -41,7 +41,7 @@ command:
   - --wandb-project
   - muon-nesterov-full
   - --batch-size
-  - "1000"
+  - "500"
   # --- SGD (for non-filter params) ---
   - --sgd-momentum
   - "0.85"

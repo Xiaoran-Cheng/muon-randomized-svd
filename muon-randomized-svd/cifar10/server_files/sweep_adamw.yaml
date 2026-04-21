@@ -37,7 +37,7 @@ command:
   - --wandb-project
   - adamw
   - --batch-size
-  - "1000"
+  - "500"
   # --- AdamW (swept + fixed) ---
   - --adamw-eps
   - "1e-8"

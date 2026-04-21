@@ -1,6 +1,11 @@
 import os
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+LINESTYLES = ["-", "--", "-.", ":"]
+MARKERS = ["o", "s", "^", "D", "v", "P"]
+USE_INSET = True   # True: zoom-in inset on the tail; False: plain plot
 
 RESULT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,16 +28,46 @@ def load_test_acc(leaf_dir):
 
 def plot_group(group_dir, labels, title, out_png, metric="val_loss"):
     fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
-    for name, label in labels.items():
+    curves = []
+    for i, (name, label) in enumerate(labels.items()):
         steps, mean, std = load_curve(os.path.join(group_dir, name), metric)
-        ax.plot(steps, mean, label=label)
-        ax.fill_between(steps, mean - std, mean + std, alpha=0.15)
+        ls = LINESTYLES[i % len(LINESTYLES)]
+        mk = MARKERS[i % len(MARKERS)]
+        line, = ax.plot(steps, mean, label=label, linestyle=ls,
+                        marker=mk, markersize=5, markevery=max(len(steps) // 10, 1))
+        ax.fill_between(steps, mean - std, mean + std, alpha=0.12, color=line.get_color())
+        curves.append((steps, mean, line.get_color(), ls, mk))
     ax.set_xlabel("step", fontsize=18)
     ax.set_ylabel(metric.replace("_", " "), fontsize=18)
+    # ax.set_yscale("log")
     ax.tick_params(axis="both", labelsize=18)
     # ax.set_title(title)
-    ax.legend(fontsize=15)
+    ax.legend(loc="upper left", fontsize=13)
     ax.grid(True, alpha=0.3)
+
+    if USE_INSET and curves:
+        # zoom region: each curve's own last 25% (handles unequal step counts, e.g. E4)
+        tail_segs = []
+        for steps, mean, *_ in curves:
+            t = int(len(steps) * 0.75)
+            tail_segs.append((steps[t:], mean[t:]))
+        x1 = min(seg[0][0] for seg in tail_segs)
+        x2 = max(seg[0][-1] for seg in tail_segs)
+        tail_vals = np.concatenate([seg[1] for seg in tail_segs])
+        y_pad = (tail_vals.max() - tail_vals.min()) * 0.15 + 1e-6
+        y1, y2 = tail_vals.min() - y_pad, tail_vals.max() + y_pad
+
+        # inset in upper-right, connectors point down-right to the tail box
+        axins = ax.inset_axes([0.55, 0.5, 0.42, 0.42])
+        for steps, mean, color, ls, mk in curves:
+            axins.plot(steps, mean, linestyle=ls, marker=mk,
+                       markersize=4, color=color)
+        axins.set_xlim(x1, x2)
+        axins.set_ylim(y1, y2)
+        axins.tick_params(axis="both", labelsize=10)
+        axins.grid(True, alpha=0.3)
+        ax.indicate_inset_zoom(axins, edgecolor="black", linewidth=0.8, alpha=0.8)
+
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
     print(f"saved {out_png}")
@@ -64,10 +99,10 @@ E5_DIR = os.path.join(RESULT_DIR, "E5_methods_comparison")
 E5_LABELS = {
     "AdamW":             "AdamW",
     "SGDNesterov":       "SGD-Nesterov",
-    "MuonPolyakFull":    "Muon Polyak (full SVD)",
-    "MuonPolyakRand":    "Muon Polyak (rand SVD)",
-    "MuonNesterovFull":  "Muon Nesterov (full SVD)",
-    "MuonNesterovRand":  "Muon Nesterov (rand SVD)",
+    "MuonPolyakFull":    "Full Muon Polyak",
+    "MuonPolyakRand":    "Randomized Muon Polyak",
+    "MuonNesterovFull":  "Full Muon Nesterov",
+    "MuonNesterovRand":  "Randomized Muon Nesterov",
 }
 for m in METRICS:
     plot_group(E5_DIR, E5_LABELS, f"E5: {m.replace('_', ' ')}",

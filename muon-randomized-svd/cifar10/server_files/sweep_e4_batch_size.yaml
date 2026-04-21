@@ -31,11 +31,11 @@ command:
   - "0.85"
   - --sgd-nesterov
   - "True"
-  # --- Muon (anchor: cifar10.sh best) ---
+  # --- Muon (anchor: final_muon_nesterov_rand.sh best) ---
   - --muon-lr
-  - "0.19572308843587835"
+  - "0.10471931304418906"
   - --muon-momentum
-  - "0.48356183431214944"
+  - "0.7098608967968731"
   - --muon-nesterov
   - "True"
   # --- SGD filter (unused in muon mode) ---
@@ -54,18 +54,18 @@ command:
   - "0.24"
   - --filter-adamw-weight-decay
   - "0.0"
-  # --- Randomized solver (anchor: cifar10.sh best) ---
+  # --- Randomized solver (anchor: final_muon_nesterov_rand.sh best) ---
   - --randomized
   - "True"
   - --inexact_solver
-  - cubic_ns_theoretical
+  - quintic_ns_theoretical
   - --rank
-  - "256"
+  - "128"
   - --oversampling
   - "10"
   - --power-iters
   - "2"
   - --orth-steps
-  - "9"
+  - "7"
   # --- Swept by ${args}: batch_size ---
   - ${args}

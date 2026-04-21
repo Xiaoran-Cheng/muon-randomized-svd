@@ -1,7 +1,13 @@
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    # Older Triton (A100 setups) lacks TMA descriptors. linear_relu_square requires
+    # it and is Hopper-only anyway; train_gpt.py swaps to an eager fallback on
+    # non-Hopper GPUs so this import failure doesn't crash smoke tests.
+    TensorDescriptor = None
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
