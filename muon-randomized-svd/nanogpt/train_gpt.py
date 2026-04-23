@@ -939,12 +939,25 @@ class NorMuonAndAdam:
         lm_cfg = self.param_cfgs[lm_head]
         embed_cfg = self.param_cfgs[embed]
 
-        embed_state['step'] = lm_state['step'] # Preserve step count for bias correction
+        # 'step' is only present for Adam state; SGD/NorMuon don't carry one.
+        if "step" in lm_state:
+            embed_state["step"] = lm_state["step"]
+
+        # Which state tensors to transfer depends on lm_head's optimizer type.
+        # Must match the keys initialized in _init_state.
+        if lm_cfg.optim == "adam":
+            tensor_keys = ["exp_avg", "exp_avg_sq"]
+        elif lm_cfg.optim == "sgd_nesterov":
+            tensor_keys = ["momentum_buffer"]
+        elif lm_cfg.optim == "normuon":
+            tensor_keys = ["momentum_buffer", "second_momentum_buffer", "mantissa"]
+        else:
+            tensor_keys = []
 
         # Copy optimizer state with all-gather + transpose + reshard when needed.
         if self.world_size > 1:
             rank = dist.get_rank()
-            for key in ["exp_avg", "exp_avg_sq"]:
+            for key in tensor_keys:
                 if lm_cfg.comms.startswith("sharded"):
                     lm_chunk = lm_state[key]
                     full_lm = torch.empty(
@@ -961,7 +974,7 @@ class NorMuonAndAdam:
                 else:
                     embed_state[key].copy_(full_embed)
         else:
-            for key in ["exp_avg", "exp_avg_sq"]:
+            for key in tensor_keys:
                 embed_state[key].copy_(lm_state[key].T)
 
         # Mark as split
