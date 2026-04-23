@@ -13,6 +13,7 @@ import copy
 import glob
 import math
 import pickle
+import random
 import threading
 import time
 import uuid
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
+
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -56,12 +58,28 @@ else:
 
 dynamo.config.recompile_limit = 64
 
+def round_up_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        raise ValueError(f"multiple must be positive, got {multiple}")
+    return ((int(value) + multiple - 1) // multiple) * multiple
+
 # -----------------------------------------------------------------------------
 # Distributed training setup
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+reference_world_size = int(os.environ.get("REFERENCE_WORLD_SIZE", "8"))
+if reference_world_size <= 0:
+    raise ValueError(f"REFERENCE_WORLD_SIZE must be positive, got {reference_world_size}")
+grad_accum_steps_override = os.environ.get("GRAD_ACCUM_STEPS")
+if grad_accum_steps_override is not None:
+    grad_accum_steps = int(grad_accum_steps_override)
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
+else:
+    # Match the 8-GPU baseline exactly when possible, and otherwise choose the
+    # smallest accumulation that does not increase per-rank batch size.
+    grad_accum_steps = max(1, math.ceil(reference_world_size / world_size))
+runtime_batch_multiple = world_size * grad_accum_steps
 grad_scale = 1 / grad_accum_steps # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -69,6 +87,11 @@ torch.cuda.set_device(device)
 dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+if master_process and grad_accum_steps_override is None and reference_world_size % world_size != 0:
+    print(
+        f"REFERENCE_WORLD_SIZE={reference_world_size} is not divisible by WORLD_SIZE={world_size}; "
+        f"using GRAD_ACCUM_STEPS={grad_accum_steps} (effective batch multiple {runtime_batch_multiple})."
+    )
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -646,6 +669,15 @@ class NorMuonAndAdam:
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
 
+        if comms.startswith("sharded") and optim in ("adam", "sgd_nesterov"):
+            if param.shape[0] % self.world_size != 0:
+                if master_process:
+                    print(
+                        f"Falling back to replicated comms for {label}: "
+                        f"shape[0]={param.shape[0]} is not divisible by world_size={self.world_size}"
+                    )
+                comms = "replicated"
+
         if optim == "adam":
             chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
             # step_gated defaults to True for Adam under Muon variant (existing behavior:
@@ -669,11 +701,16 @@ class NorMuonAndAdam:
             reshape = getattr(param, "reshape", None)
             if reshape is None:
                 raise ValueError(f"NorMuon param {label} must have .reshape attribute")
-            if reshape[0] % self.world_size != 0:
-                raise ValueError(f"reshape[0]={reshape[0]} must be divisible by world_size")
+            if comms.startswith("sharded") and reshape[0] % self.world_size != 0:
+                if master_process:
+                    print(
+                        f"Falling back to replicated comms for {label}: "
+                        f"reshape[0]={reshape[0]} is not divisible by world_size={self.world_size}"
+                    )
+                comms = "replicated"
 
-            chunk_size = reshape[0] // self.world_size
-            chunk_shape = (chunk_size, *reshape[1:])
+            chunk_size = reshape[0] // self.world_size if comms.startswith("sharded") else None
+            chunk_shape = (chunk_size, *reshape[1:]) if comms.startswith("sharded") else reshape
             # Shape-based LR multiplier for NorMuon
             shape_mult = max(1.0, chunk_shape[-2] / chunk_shape[-1]) ** 0.5 if len(chunk_shape) >= 2 else 1.0
             lr_mul = shape_mult * lr_mul
@@ -682,9 +719,10 @@ class NorMuonAndAdam:
             per_matrix_lr_mul = None
             if label == "mlp_bank":
                 rank = dist.get_rank() if dist.is_initialized() else 0
-                start_idx = rank * chunk_size
+                start_idx = rank * chunk_size if comms.startswith("sharded") else 0
+                local_count = chunk_size if comms.startswith("sharded") else reshape[0]
                 per_matrix_lr_mul = []
-                for i in range(chunk_size):
+                for i in range(local_count):
                     global_idx = start_idx + i
                     is_c_proj = (global_idx % 2 == 1)
                     per_matrix_lr_mul.append(2.0 if is_c_proj else 1.0)
@@ -903,20 +941,26 @@ class NorMuonAndAdam:
 
         embed_state['step'] = lm_state['step'] # Preserve step count for bias correction
 
-        # Copy optimizer state with all-gather + transpose + reshard
+        # Copy optimizer state with all-gather + transpose + reshard when needed.
         if self.world_size > 1:
             rank = dist.get_rank()
-            lm_chunk_size = lm_cfg.chunk_size  # 96
-            embed_chunk_size = embed_cfg.chunk_size  # 6288
-
-            # All-gather lm_head momentum to get full (768, 50304) tensor
             for key in ["exp_avg", "exp_avg_sq"]:
-                lm_chunk = lm_state[key]  # (96, 50304)
-                full_lm = torch.empty(lm_head.shape[0], lm_head.shape[1], dtype=lm_chunk.dtype, device=lm_chunk.device)
-                dist.all_gather_into_tensor(full_lm, lm_chunk.contiguous())
-                embed_state[key].copy_(full_lm.T[rank * embed_chunk_size:(rank + 1) * embed_chunk_size])
+                if lm_cfg.comms.startswith("sharded"):
+                    lm_chunk = lm_state[key]
+                    full_lm = torch.empty(
+                        lm_head.shape[0], lm_head.shape[1], dtype=lm_chunk.dtype, device=lm_chunk.device
+                    )
+                    dist.all_gather_into_tensor(full_lm, lm_chunk.contiguous())
+                else:
+                    full_lm = lm_state[key]
+
+                full_embed = full_lm.T
+                if embed_cfg.comms.startswith("sharded"):
+                    embed_chunk_size = embed_cfg.chunk_size
+                    embed_state[key].copy_(full_embed[rank * embed_chunk_size:(rank + 1) * embed_chunk_size])
+                else:
+                    embed_state[key].copy_(full_embed)
         else:
-            # Single GPU: simple transpose
             for key in ["exp_avg", "exp_avg_sq"]:
                 embed_state[key].copy_(lm_state[key].T)
 
@@ -1370,11 +1414,20 @@ class AttnArgs:
 #   1. FA3 kernel via HuggingFace `kernels` library (H100 fast path)
 #   2. FA2 via `flash-attn` pip package (Ampere-compatible)
 #   3. xformers memory_efficient_attention (cu11/cu12, manylinux2014 glibc)
-try:
-    flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    _fa_varlen_func = flash_attn_interface.flash_attn_varlen_func
-    _FA_BACKEND = "fa3"
-except Exception:
+_disable_fa3 = os.environ.get("DISABLE_FA3", "0") == "1"
+if _device_cap[0] >= 9 and not _disable_fa3:
+    try:
+        flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        _fa_varlen_func = flash_attn_interface.flash_attn_varlen_func
+        _FA_BACKEND = "fa3"
+    except Exception:
+        _fa_varlen_func = None
+        _FA_BACKEND = None
+else:
+    _fa_varlen_func = None
+    _FA_BACKEND = None
+
+if _FA_BACKEND is None:
     try:
         from flash_attn import flash_attn_varlen_func as _fa_varlen_func
         _FA_BACKEND = "fa2"
@@ -1481,6 +1534,9 @@ class CausalSelfAttention(nn.Module):
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+def align_runtime_batch_size(v: float | int):
+    return next_multiple_of_n(v, n=runtime_batch_multiple)
 
 @dataclass
 class ForwardScheduleConfig:
@@ -1799,8 +1855,9 @@ def get_bigram_hash(x):
     out[1:] = torch.bitwise_xor(rand_int_1 * out[1:], rand_int_2 * out[:-1]) % mod
     return out
 
-def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True, files_seed: int | None = None):
     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
+    # files_seed: if set, shuffle the shard file order with this seed (uses a private RNG, doesn't touch torch global)
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
@@ -1809,6 +1866,8 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+    if files_seed is not None:
+        random.Random(files_seed).shuffle(files)
 
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens = _load_data_shard(next(file_iter))
@@ -1889,9 +1948,9 @@ class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", ".")
     train_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_train_*.bin") # input .bin to train on
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
-    val_tokens: int = int(os.environ.get("SMOKE_VAL_TOKENS_TOTAL", 10485760)) # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens: int = int(os.environ.get("VAL_TOKENS", 10485760)) # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = int(os.environ.get("SMOKE_VAL_TOKENS", 4 * 64 * 1024 * 8))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 4 * 64 * 1024 * 8))
     # schedule
     num_scheduled_iterations: int = int(os.environ.get("NUM_ITERATIONS", 1450))  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = int(os.environ.get("NUM_EXT_ITERATIONS", 40))  # number of steps to continue training at final lr and ws
@@ -1930,7 +1989,7 @@ class Hyperparameters:
     muon_momentum: float = 0.95        # peak value of the Muon momentum warmup
     muon_nesterov: bool  = True        # True â†’ Nesterov; False â†’ Polyak (mirrors --muon-nesterov)
     rank:          int   = 0           # 0 â†’ fall back to rank_ratio; otherwise absolute rank
-    seed_base:     int   = 0           # trial_id is added to this for per-trial fresh init
+    seed_base:     int   = 42           # trial_id is added to this for per-trial fresh init
     seq_len:       int   = 2048        # middle factor in batch_size = N*seq_len*world_size (curriculum-uniform)
     cli_args_dict: dict  = field(default_factory=dict)   # snapshot of parsed argparse values, for folder naming
 
@@ -1974,7 +2033,7 @@ def _build_cli_parser():
                    help="Absolute target rank k for randomized projection. 0 = fall back to rank_ratio semantics.")
     p.add_argument("--oversampling", type=int, default=None)
     p.add_argument("--power-iters", "--power_iters", type=int, default=None)
-    # Batch schedule knob: middle factor in batch_size = N * seq_len * world_size (scales uniformly across stages)
+    # Batch schedule knob: middle factor in batch_size = N * seq_len * reference_world_size (scales uniformly across stages)
     p.add_argument("--seq-len", "--seq_len", type=int, default=2048,
                    help="Middle factor of batch_size formula (uniformly scales total batch across all curriculum stages).")
     # Output dir / logging
@@ -2037,6 +2096,17 @@ def _merge_cli_into_args(args: Hyperparameters, cli_args: argparse.Namespace) ->
 
 _merge_cli_into_args(args, cli_args)
 
+original_val_batch_size = args.val_batch_size
+original_val_tokens = args.val_tokens
+args.val_batch_size = round_up_to_multiple(args.val_batch_size, runtime_batch_multiple)
+args.val_tokens = round_up_to_multiple(args.val_tokens, args.val_batch_size)
+if master_process and (args.val_batch_size != original_val_batch_size or args.val_tokens != original_val_tokens):
+    print(
+        f"Adjusted validation settings for WORLD_SIZE={world_size}: "
+        f"val_batch_size {original_val_batch_size} -> {args.val_batch_size}, "
+        f"val_tokens {original_val_tokens} -> {args.val_tokens}"
+    )
+
 
 # -----------------------------------------------------------------------------
 # Output directory naming (mirrors cifar10/airbench94_muon.py convention).
@@ -2094,7 +2164,7 @@ def _format_arg_value(value):
     return text.replace("-", "m").replace(".", "p").replace("/", "_")
 
 
-def build_output_dir(args, cli_args):
+def build_output_dir(args, cli_args, trial_id=None):
     mode = args.optimizer_variant
     folder_args = MODE_FOLDER_ARGS.get(mode, list(vars(cli_args).keys()))
     arg_items = vars(cli_args)
@@ -2105,6 +2175,8 @@ def build_output_dir(args, cli_args):
         abbr = ARG_ABBREVIATIONS.get(key, key)
         parts.append(f"{abbr}{_format_arg_value(arg_items[key])}")
     folder_name = "_".join(parts) or "default"
+    if trial_id is not None:
+        folder_name = f"{folder_name}_t{trial_id:03d}"
     output_dir = os.path.join(cli_args.log_root, mode, folder_name)
     return output_dir
 
@@ -2178,14 +2250,14 @@ class TrainingSchedule:
 # --seq-len uniformly scales total batch across all stages while preserving
 # inter-stage ratios (1:2:3), so the hand-tuned lr_mul exponents still apply.
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * args.seq_len * 8, window_sizes=(1, 3), lr_mul=1.0,
+    TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=align_runtime_batch_size(8 * args.seq_len * reference_world_size), window_sizes=(1, 3), lr_mul=1.0,
                   mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=16 * args.seq_len * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=align_runtime_batch_size(16 * args.seq_len * reference_world_size), window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
                   mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=24 * args.seq_len * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+    TrainingStage(duration=1/3, train_max_seq_len=2048, batch_size=align_runtime_batch_size(24 * args.seq_len * reference_world_size), window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
     # extension stage
-    TrainingStage(train_max_seq_len=2048, batch_size=24 * args.seq_len * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+    TrainingStage(train_max_seq_len=2048, batch_size=align_runtime_batch_size(24 * args.seq_len * reference_world_size), window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
@@ -2471,13 +2543,18 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+model_max_seq_len = max(
+    max(stage.train_max_seq_len for stage in TRAINING_STAGES),
+    args.val_batch_size // runtime_batch_multiple,
+)
+
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=model_max_seq_len
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -2490,7 +2567,7 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 if os.environ.get("DISABLE_COMPILE", "0") == "1":
-    print0("DISABLE_COMPILE=1 â†’ skipping torch.compile (smoke-test mode)", console=True)
+    print0("DISABLE_COMPILE=1, skipping torch.compile", console=True)
 elif _FA_BACKEND == "xformers":
     # xformers mask creation does .tolist() which breaks fullgraph; drop fullgraph.
     model: nn.Module = torch.compile(model, dynamic=False, fullgraph=False)
@@ -2542,10 +2619,13 @@ model.train()
 train_steps = training_schedule.total_steps
 trial_outputs: list[dict] = []
 
-# Build output_dir once up front so wandb's dir/group and the final pkl share it.
-output_dir = build_output_dir(args, cli_args)
+# Per-trial output dirs live inside the trial loop. Here we compute the base
+# folder name (without _t{trial_id} suffix) so wandb can group trials by config,
+# and the shared log parent so wandb's dir=... is stable across trials.
+base_folder_name = os.path.basename(build_output_dir(args, cli_args))
+log_parent_dir = os.path.join(cli_args.log_root, args.optimizer_variant)
 if master_process:
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(log_parent_dir, exist_ok=True)
 
 # Lazy import: avoid hard dep on wandb when --wandb is False or unavailable.
 use_wandb = bool(args.cli_args_dict.get("wandb", False)) and master_process
@@ -2553,28 +2633,49 @@ wandb = None
 if use_wandb:
     import wandb as _wandb
     wandb = _wandb
-    wandb_parent_dir = os.path.dirname(output_dir) or "."
-    os.makedirs(wandb_parent_dir, exist_ok=True)
+
+def reinit_random_weights(model):
+    """Re-randomize the stochastic parts of GPT.__init__ in place (bf16).
+    Consumes the current global torch RNG state — call torch.manual_seed /
+    torch.cuda.manual_seed_all beforehand to make it reproducible per trial."""
+    model_dim = model.value_embeds.shape[-1]
+    std = 0.5 * model_dim ** -0.5
+    bound = (3 ** 0.5) * std
+    with torch.no_grad():
+        model.value_embeds.data.normal_(mean=0.0, std=0.01)
+        model.attn_bank.data.uniform_(-bound, bound)
+        model.mlp_bank.data[:, 0, :, :].uniform_(-bound, bound)   # c_fc; c_proj stays zero
+        model.lm_head.weight.data.normal_(mean=0.0, std=0.005)
+        model.embed.weight.data.copy_(model.lm_head.weight.data.T)
+    for param in model.parameters():
+        dist.broadcast(param.detach(), 0)
+
 
 for trial_id in range(args.num_trials):
-    print0(f"========== Trial {trial_id + 1}/{args.num_trials} ==========", console=True)
-    # Restore model + optimizer to post-warmup initial state (same weights every trial;
-    # per-trial variation comes from CUDA nondeterminism + data-order differences).
-    if trial_id > 0:
-        model.zero_grad(set_to_none=True)
-        model.load_state_dict(initial_state["model"])
-        training_manager.reset(initial_state["optimizer"])
-        model.train()
+    trial_seed = args.seed_base + trial_id
+    torch.manual_seed(trial_seed)
+    torch.cuda.manual_seed_all(trial_seed)
+    print0(f"========== Trial {trial_id + 1}/{args.num_trials} (seed={trial_seed}) ==========", console=True)
+    # Per-trial output dir: appends "_t{trial_id:03d}" to the base config folder name.
+    output_dir = build_output_dir(args, cli_args, trial_id=trial_id)
+    if master_process:
+        os.makedirs(output_dir, exist_ok=True)
+    # Fresh per-trial model init + zero optimizer state. Data-shard order is also
+    # shuffled per-trial via files_seed below.
+    model.zero_grad(set_to_none=True)
+    reinit_random_weights(model)
+    training_manager.reset(initial_state["optimizer"])
+    model.train()
 
     if use_wandb:
         wandb.init(
             project=cli_args.wandb_project,
             entity=cli_args.wandb_entity,
             config=vars(cli_args),
-            group=(cli_args.wandb_group or os.path.basename(output_dir))[:128],
+            group=(cli_args.wandb_group or base_folder_name)[:128],
             name=f"trial_{trial_id:03d}",
             reinit=True,
-            dir=wandb_parent_dir,
+            dir=log_parent_dir,
         )
 
     train_loader = distributed_data_generator(
@@ -2582,6 +2683,7 @@ for trial_id in range(args.num_trials):
         TRAINING_STAGES[0].batch_size,
         TRAINING_STAGES[0].train_max_seq_len,
         grad_accum_steps=grad_accum_steps,
+        files_seed=trial_seed,
     )
     gc.collect()
 
@@ -2661,6 +2763,22 @@ for trial_id in range(args.num_trials):
         "val_loss_records": val_loss_records,
         "total_training_time_ms": training_time_ms,
     })
+    if master_process:
+        payload = {
+            "trial_id": trial_id,
+            "trial_seed": trial_seed,
+            "train_steps": list(range(train_steps)),
+            "train_losses": train_losses,
+            "train_times_ms": train_times_ms,
+            "val_steps": [s for (s, _) in val_loss_records],
+            "val_losses": [v for (_, v) in val_loss_records],
+            "total_training_time_ms": training_time_ms,
+            "args": vars(cli_args),
+        }
+        pkl_path = os.path.join(output_dir, "losses.pkl")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(payload, f)
+        print0(f"Saved trial {trial_id} losses to {pkl_path}", console=True)
     if use_wandb:
         if val_loss_records:
             wandb.log({"final_val_loss": val_loss_records[-1][1]})
@@ -2668,56 +2786,6 @@ for trial_id in range(args.num_trials):
     del train_loader
     gc.collect()
     torch.cuda.empty_cache()
-
-########################################
-#           Save losses to pkl         #
-########################################
-if master_process and len(trial_outputs) > 0:
-    # output_dir already built and created before the trial loop.
-    # Aligned val-step axis (all trials share the same cadence, verified below).
-    val_steps_ref = [s for (s, _) in trial_outputs[0]["val_loss_records"]]
-    for out in trial_outputs:
-        if [s for (s, _) in out["val_loss_records"]] != val_steps_ref:
-            raise RuntimeError("val_loss step indices differ across trials; cannot align columns")
-
-    train_step_axis = list(range(train_steps))
-    num_trials_run = len(trial_outputs)
-
-    train_columns, train_values = [], []
-    train_time_columns, train_time_values_ms = [], []
-    val_columns, val_values = [], []
-    total_training_time_ms_per_trial = []
-    for t_idx, out in enumerate(trial_outputs):
-        train_columns.append(f"trial_{t_idx:03d}_train_loss")
-        train_values.append(out["train_losses"])
-        train_time_columns.append(f"trial_{t_idx:03d}_train_time_ms")
-        train_time_values_ms.append(out["train_times_ms"])
-        val_columns.append(f"trial_{t_idx:03d}_val_loss")
-        val_values.append([v for (_, v) in out["val_loss_records"]])
-        total_training_time_ms_per_trial.append(out["total_training_time_ms"])
-
-    # Transpose so each column corresponds to one trial (rows = step axis).
-    train_values_t         = list(map(list, zip(*train_values)))         if train_values         else []
-    train_time_values_t_ms = list(map(list, zip(*train_time_values_ms))) if train_time_values_ms else []
-    val_values_t           = list(map(list, zip(*val_values)))           if val_values           else []
-
-    payload = {
-        "train_steps": train_step_axis,
-        "train_columns": train_columns,
-        "train_values": train_values_t,
-        "train_time_columns": train_time_columns,
-        "train_time_values_ms": train_time_values_t_ms,
-        "val_steps": val_steps_ref,
-        "val_columns": val_columns,
-        "val_values": val_values_t,
-        "total_training_time_ms": total_training_time_ms_per_trial,
-        "args": vars(cli_args),
-        "num_trials": num_trials_run,
-    }
-    pkl_path = os.path.join(output_dir, "losses.pkl")
-    with open(pkl_path, "wb") as f:
-        pickle.dump(payload, f)
-    print0(f"Saved losses to {pkl_path}", console=True)
 
 if args.run_evals:
     model.eval()

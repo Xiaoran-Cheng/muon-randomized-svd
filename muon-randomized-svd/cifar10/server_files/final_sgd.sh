@@ -13,9 +13,9 @@ python airbench94_muon.py \
   --wandb-project sgd-nesterov \
   --wandb-group final_$(date +%Y%m%d_%H%M%S) \
   --batch-size 1000 \
-  --sgd-momentum 0.7803207060321236 \
+  --sgd-momentum 0.8013929037741372 \
   --sgd-nesterov True \
-  --filter-sgd-lr 0.010246282253551588 \
+  --filter-sgd-lr 0.011995815961073663 \
   --filter-sgd-weight-decay 0.0 \
   --muon-lr 0.24 \
   --muon-momentum 0.6 \
