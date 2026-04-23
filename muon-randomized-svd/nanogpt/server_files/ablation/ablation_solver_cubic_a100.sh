@@ -31,4 +31,5 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py \
   --sgd-nesterov True \
   --adamw-lr 0.001 \
   --seq-len 2048 \
+  --log-root ablation_Logs \
   "$@"
