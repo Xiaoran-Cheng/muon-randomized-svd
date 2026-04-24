@@ -4,7 +4,7 @@ export LD_LIBRARY_PATH="/usr/lib64:/lib64:$LD_LIBRARY_PATH"
 source /home/xcheng328/miniconda3/bin/activate muon
 
 
-python airbench94_muon.py \
+python airbench94_muon_a6000.py \
   --optimizer-mode sgd \
   --epochs 8 \
   --num-trials 50 \
@@ -12,10 +12,10 @@ python airbench94_muon.py \
   --wandb True \
   --wandb-project sgd-nesterov \
   --wandb-group final_$(date +%Y%m%d_%H%M%S) \
-  --batch-size 1000 \
-  --sgd-momentum 0.8013929037741372 \
+  --batch-size 500 \
+  --sgd-momentum 0.7061487457292506 \
   --sgd-nesterov True \
-  --filter-sgd-lr 0.011995815961073663 \
+  --filter-sgd-lr 0.017051314712312846 \
   --filter-sgd-weight-decay 0.0 \
   --muon-lr 0.24 \
   --muon-momentum 0.6 \

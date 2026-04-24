@@ -4,7 +4,7 @@ export LD_LIBRARY_PATH="/usr/lib64:/lib64:$LD_LIBRARY_PATH"
 source /home/xcheng328/miniconda3/bin/activate muon
 
 
-python airbench94_muon.py \
+python airbench94_muon_a6000.py \
   --optimizer-mode adamw \
   --epochs 8 \
   --num-trials 50 \
@@ -12,11 +12,11 @@ python airbench94_muon.py \
   --wandb True \
   --wandb-project adamw \
   --wandb-group final_$(date +%Y%m%d_%H%M%S) \
-  --batch-size 1000 \
-  --adamw-beta1 0.8515089825365614 \
-  --adamw-beta2 0.99781053000259 \
+  --batch-size 500 \
+  --adamw-beta1 0.8604272479139393 \
+  --adamw-beta2 0.996314442163105 \
   --adamw-eps 1e-8 \
-  --filter-adamw-lr 0.003124360509061702 \
+  --filter-adamw-lr 0.0032280803645816005 \
   --filter-adamw-weight-decay 0.0 \
   --sgd-momentum 0.85 \
   --sgd-nesterov True \
