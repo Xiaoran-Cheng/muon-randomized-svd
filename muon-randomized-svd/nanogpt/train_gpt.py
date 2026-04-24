@@ -2350,6 +2350,9 @@ class TrainingManager():
                 entry["optim"] = "sgd_nesterov"
                 entry["step_gated"] = False
                 entry.pop("adam_betas", None)
+                # Reset Adam-tuned per-param lr multipliers: SGD has no adaptive
+                # scaling, so lr_mul=75 on value_embeds/bigram_embed causes NaN.
+                entry["lr_mul"] = 1.0
             self.param_table["attn_bank"]["comms"]    = "replicated"
             self.param_table["mlp_bank"]["comms"]     = "replicated"
             self.param_table["bigram_embed"]["comms"] = "sharded"
