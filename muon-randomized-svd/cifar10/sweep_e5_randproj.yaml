@@ -1,0 +1,74 @@
+# E5: Randomized Projection Method Ablation (anchored at cifar10.sh final-best config)
+program: airbench94_muon.py
+entity: xjc5161-penn-state
+project: e5-randproj
+method: grid
+metric:
+  name: final_val_acc
+  goal: maximize
+parameters:
+  projection_method:
+    values:
+      - kaczmarz
+command:
+  - ${env}
+  - python
+  - ${program}
+  # --- General ---
+  - --optimizer-mode
+  - muon
+  - --epochs
+  - "8"
+  - --num-trials
+  - "50"
+  - --val-every-steps
+  - "10"
+  - --wandb
+  - "True"
+  - --wandb-project
+  - e5-randproj
+  - --batch-size
+  - "500"
+  # --- SGD (for non-filter params) ---
+  - --sgd-momentum
+  - "0.85"
+  - --sgd-nesterov
+  - "True"
+  # --- Muon (anchor: final_muon_nesterov_rand.sh best) ---
+  - --muon-lr
+  - "0.10471931304418906"
+  - --muon-momentum
+  - "0.7098608967968731"
+  - --muon-nesterov
+  - "True"
+  # --- SGD filter (unused in muon mode) ---
+  - --filter-sgd-lr
+  - "0.24"
+  - --filter-sgd-weight-decay
+  - "0.0"
+  # --- AdamW (unused in muon mode) ---
+  - --adamw-beta1
+  - "0.9"
+  - --adamw-beta2
+  - "0.999"
+  - --adamw-eps
+  - "1e-8"
+  - --filter-adamw-lr
+  - "0.24"
+  - --filter-adamw-weight-decay
+  - "0.0"
+  # --- Randomized solver (anchor: final_muon_nesterov_rand.sh best) ---
+  - --randomized
+  - "True"
+  - --inexact_solver
+  - quintic_ns_theoretical
+  - --rank
+  - "128"
+  - --oversampling
+  - "10"
+  - --power-iters
+  - "2"
+  - --orth-steps
+  - "7"
+  # --- Swept by ${args}: projection_method ---
+  - ${args}

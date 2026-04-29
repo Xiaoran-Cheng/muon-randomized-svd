@@ -19,6 +19,16 @@ from itertools import repeat
 import math
 from math import ceil
 
+# Pin Triton/Inductor JIT caches to node-local /tmp, namespaced by user+host,
+# so the NFS-shared home cache can't serve a .so compiled against a glibc
+# that the current node doesn't have. Must run before `import torch`.
+import socket as _socket
+_cache_root = f"/tmp/{os.environ.get('USER', 'anon')}_{_socket.gethostname().split('.')[0]}"
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_cache_root, "triton"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_cache_root, "torchinductor"))
+os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -171,6 +181,50 @@ def randomized_project(M, rank=32, oversampling=2, power_iters=0):
     B = (Q_f32.T @ M_f32).to(M.dtype)
     return Q, B
 
+
+
+def randomized_project_kaczmarz(M, rank=32, oversampling=2, power_iters=1):
+    m, n = M.shape
+    ell = rank + oversampling
+
+    # Do the sampling and projection in fp32 for numerical stability,
+    # same reasoning as the Gaussian version (sigma_max cubed can overflow fp16).
+    M_f32 = M.float()
+
+    # Column probabilities: p_j = ||M_{:,j}||^2 / ||M||_F^2
+    col_norms_sq = (M_f32 * M_f32).sum(dim=0)            # (n,)
+    fro_sq = col_norms_sq.sum()
+    # Guard against all-zero columns (probs would be NaN). Fall back to uniform.
+    if fro_sq <= 0:
+        probs = torch.full((n,), 1.0 / n, device=M.device, dtype=torch.float32)
+    else:
+        probs = col_norms_sq / fro_sq                    # (n,)
+
+    # Sample ell column indices with probabilities proportional to col_norms_sq.
+    # Replacement=True is fine when ell << n (typical), and matches the standard
+    # importance-sampling sketch theory.
+    idx = torch.multinomial(probs, ell, replacement=True)  # (ell,)
+
+    # Y = M @ Omega, where Omega[:, k] = e_{idx[k]} / sqrt(ell * probs[idx[k]]).
+    # This is the unbiased rescaling that gives E[Omega Omega^T] = I.
+    # Implemented as column selection + per-column scaling (no real matmul).
+    p_sampled = probs[idx]                                # (ell,)
+    # Clamp to avoid div-by-zero if a zero-prob column somehow got sampled
+    # (shouldn't happen with multinomial, but defensive).
+    scale = 1.0 / torch.sqrt(ell * p_sampled.clamp_min(1e-30))  # (ell,)
+    Y = M_f32[:, idx] * scale.unsqueeze(0)                # (m, ell)
+
+    # Power iteration: Y <- (M M^T)^q Y. Same as the Gaussian version.
+    for _ in range(power_iters):
+        Y = M_f32 @ (M_f32.T @ Y)
+
+    Q_f32, _ = torch.linalg.qr(Y)
+    Q = Q_f32.to(M.dtype)
+    B = (Q_f32.T @ M_f32).to(M.dtype)
+    return Q, B
+
+
+
 INEXACT_SOLVERS = (
     "polar_express",
     "cubic_ns_theoretical",
@@ -187,10 +241,19 @@ SOLVER_FN = {
 }
 
 
+PROJECTION_METHODS = ("gaussian", "kaczmarz")
+
+PROJECTION_FN = {
+    "gaussian": randomized_project,
+    "kaczmarz": randomized_project_kaczmarz,
+}
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, momentum=0, nesterov=False,
                  orth_method="quintic_ns_empirical", orth_steps=3,
-                 randomized=False, rank=32, oversampling=2, power_iters=0):
+                 randomized=False, projection_method="gaussian",
+                 rank=32, oversampling=2, power_iters=0):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if momentum < 0.0:
@@ -201,6 +264,8 @@ class Muon(torch.optim.Optimizer):
             raise ValueError(f"Invalid orth_method: {orth_method}")
         if orth_steps < 0:
             raise ValueError(f"orth_steps must be non-negative, got {orth_steps}")
+        if projection_method not in PROJECTION_METHODS:
+            raise ValueError(f"Invalid projection_method: {projection_method}")
         defaults = dict(
             lr=lr,
             momentum=momentum,
@@ -208,6 +273,7 @@ class Muon(torch.optim.Optimizer):
             orth_method=orth_method,
             orth_steps=int(orth_steps),
             randomized=bool(randomized),
+            projection_method=projection_method,
             rank=int(rank),
             oversampling=int(oversampling),
             power_iters=int(power_iters),
@@ -221,10 +287,12 @@ class Muon(torch.optim.Optimizer):
             orth_method = group["orth_method"]
             orth_steps = int(group["orth_steps"])
             randomized = group["randomized"]
+            projection_method = group["projection_method"]
             rank = int(group["rank"])
             oversampling = int(group["oversampling"])
             power_iters = int(group["power_iters"])
             solver_fn = SOLVER_FN[orth_method]
+            projection_fn = PROJECTION_FN[projection_method]
 
             for p in group["params"]:
                 g = p.grad
@@ -243,9 +311,9 @@ class Muon(torch.optim.Optimizer):
 
                 if randomized:
                     # 1. Project: Q (m x ell), B (ell x n)
-                    Q, B = randomized_project(g2d, rank=rank,
-                                              oversampling=oversampling,
-                                              power_iters=power_iters)
+                    Q, B = projection_fn(g2d, rank=rank,
+                                         oversampling=oversampling,
+                                         power_iters=power_iters)
                     # 2. Solver on compressed B
                     Z = solver_fn(B, steps=orth_steps, eps=1e-7)
                     # 3. Lift back: T = Q @ Z
@@ -526,6 +594,7 @@ FOLDER_ARGS = [
     "inexact_solver",
     "orth_steps",
     "randomized",
+    "projection_method",
     "rank",
     "oversampling",
     "power_iters",
@@ -540,6 +609,7 @@ ARG_ABBREVIATIONS = {
     "muon_momentum": "mmm",
     "muon_nesterov": "mn",
     "randomized": "rz",
+    "projection_method": "pm",
     "rank": "rk",
     "oversampling": "ov",
     "power_iters": "pi",
@@ -564,7 +634,7 @@ def build_output_dir_from_args(args):
         parts.append(f"{abbr}{_format_arg_value(arg_items[key])}")
     folder_name = "_".join(parts)
     variant_subdir = getattr(args, "wandb_project", None) or "default"
-    output_dir = os.path.join("logs", variant_subdir, folder_name)
+    output_dir = os.path.join("logs_a6000", variant_subdir, folder_name)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -583,7 +653,7 @@ def main(run, model, optimizer_mode, orth_method, orth_steps, batch_size, epochs
          muon_lr, muon_momentum, muon_nesterov,
          filter_sgd_lr, filter_sgd_weight_decay,
          adamw_beta1, adamw_beta2, adamw_eps, filter_adamw_lr, filter_adamw_weight_decay,
-         randomized, rank, oversampling, power_iters,
+         randomized, projection_method, rank, oversampling, power_iters,
          use_wandb=False):
     optimizer_mode = str(optimizer_mode)
     batch_size = int(batch_size)
@@ -693,6 +763,7 @@ def main(run, model, optimizer_mode, orth_method, orth_steps, batch_size, epochs
             orth_method=orth_method,
             orth_steps=orth_steps,
             randomized=randomized,
+            projection_method=projection_method,
             rank=rank,
             oversampling=oversampling,
             power_iters=power_iters,
@@ -990,6 +1061,14 @@ if __name__ == "__main__":
         help="Enable randomized subspace projection before the solver (True/False).",
     )
     parser.add_argument(
+        "--projection-method", "--projection_method",
+        type=str,
+        default="gaussian",
+        choices=PROJECTION_METHODS,
+        help="Sketch family used by the randomized projection: 'gaussian' (dense Omega) or "
+             "'kaczmarz' (sparse importance-sampled column selection).",
+    )
+    parser.add_argument(
         "--rank",
         type=int,
         default=32,
@@ -1098,6 +1177,7 @@ if __name__ == "__main__":
         args.filter_adamw_lr,
         args.filter_adamw_weight_decay,
         args.randomized,
+        args.projection_method,
         args.rank,
         args.oversampling,
         args.power_iters,
@@ -1139,6 +1219,7 @@ if __name__ == "__main__":
             args.filter_adamw_lr,
             args.filter_adamw_weight_decay,
             args.randomized,
+            args.projection_method,
             args.rank,
             args.oversampling,
             args.power_iters,
