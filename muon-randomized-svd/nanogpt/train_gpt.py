@@ -11,6 +11,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
 import argparse
 import copy
 import glob
+import importlib
 import math
 import pickle
 import random
@@ -410,16 +411,104 @@ def randomized_project(M: torch.Tensor, k: int, p: int, h: int):
         return Q, B_small, False
 
 
+@torch.no_grad()
+def randomized_project_kaczmarz(M: torch.Tensor, k: int, p: int, h: int):
+    """Importance-sampling (Kaczmarz-style) randomized range finder.
+
+    Same input/output contract as `randomized_project`, but Omega is a column-
+    selection sketch instead of a Gaussian sketch:
+      tall  (m > n):  sample r = k+p columns of M with prob p_j ~ ||M_{:,j}||^2
+                     Y[:, k] = M[:, idx[k]] / sqrt(r * p_j),  E[Omega Omega^T] = I
+      wide  (m <= n): sample r rows of M with prob p_i ~ ||M_{i,:}||^2 (= cols of M^T)
+
+    Sampling + scaling is implemented as a gather + per-column scale (no real
+    matmul). Power iteration, QR, and B = Q^T @ M (or M @ Q) are identical to
+    the Gaussian variant. fp32 internally for numerical stability (sigma_max^3
+    can overflow fp16 in the power step), cast back to M.dtype on return.
+    """
+    is_tall = M.size(-2) > M.size(-1)
+    m, n = M.size(-2), M.size(-1)
+    r = k + p
+    batch_shape = M.shape[:-2]
+
+    M_f32 = M.float()
+
+    if is_tall:
+        # Sample columns of M (axis -1) by squared column norm.
+        col_norms_sq = (M_f32 * M_f32).sum(dim=-2)                       # (..., n)
+        fro_sq = col_norms_sq.sum(dim=-1, keepdim=True)                  # (..., 1)
+        # Uniform fallback for all-zero matrices (probs would be NaN otherwise).
+        probs = torch.where(
+            fro_sq > 0,
+            col_norms_sq / fro_sq.clamp_min(1e-30),
+            torch.full_like(col_norms_sq, 1.0 / n),
+        )                                                                 # (..., n)
+        # multinomial only takes 1D/2D probs; flatten leading batch dims.
+        probs_flat = probs.reshape(-1, n)
+        idx_flat = torch.multinomial(probs_flat, r, replacement=True)    # (B, r)
+        idx = idx_flat.reshape(*batch_shape, r)                          # (..., r)
+
+        # Y = M[:, idx] (gather columns); scale per column by 1/sqrt(r*p_j).
+        idx_cols = idx.unsqueeze(-2).expand(*batch_shape, m, r)          # (..., m, r)
+        Y = torch.gather(M_f32, -1, idx_cols)                            # (..., m, r)
+        p_sampled = torch.gather(probs, -1, idx)                         # (..., r)
+        scale = (r * p_sampled.clamp_min(1e-30)).rsqrt()                 # (..., r)
+        Y = Y * scale.unsqueeze(-2)
+
+        for _ in range(h):
+            Y = M_f32 @ (M_f32.mT @ Y)
+        Q_f32, _ = torch.linalg.qr(Y, mode="reduced")
+        Q = Q_f32.to(M.dtype)                                            # (..., m, r)
+        B_small = (Q_f32.mT @ M_f32).to(M.dtype)                         # (..., r, n)
+        return Q, B_small, True
+    else:
+        # Sample rows of M (axis -2) by squared row norm.
+        row_norms_sq = (M_f32 * M_f32).sum(dim=-1)                       # (..., m)
+        fro_sq = row_norms_sq.sum(dim=-1, keepdim=True)                  # (..., 1)
+        probs = torch.where(
+            fro_sq > 0,
+            row_norms_sq / fro_sq.clamp_min(1e-30),
+            torch.full_like(row_norms_sq, 1.0 / m),
+        )                                                                 # (..., m)
+        probs_flat = probs.reshape(-1, m)
+        idx_flat = torch.multinomial(probs_flat, r, replacement=True)
+        idx = idx_flat.reshape(*batch_shape, r)                          # (..., r)
+
+        # Y = M^T[:, idx] = (selected rows of M)^T.
+        idx_rows = idx.unsqueeze(-1).expand(*batch_shape, r, n)          # (..., r, n)
+        rows = torch.gather(M_f32, -2, idx_rows)                         # (..., r, n)
+        Y = rows.mT.contiguous()                                          # (..., n, r)
+        p_sampled = torch.gather(probs, -1, idx)                         # (..., r)
+        scale = (r * p_sampled.clamp_min(1e-30)).rsqrt()                 # (..., r)
+        Y = Y * scale.unsqueeze(-2)
+
+        for _ in range(h):
+            Y = M_f32.mT @ (M_f32 @ Y)
+        Q_f32, _ = torch.linalg.qr(Y, mode="reduced")
+        Q = Q_f32.to(M.dtype)                                            # (..., n, r)
+        B_small = (M_f32 @ Q_f32).to(M.dtype)                            # (..., m, r)
+        return Q, B_small, False
+
+
+PROJECTOR_REGISTRY = {
+    "gaussian": randomized_project,
+    "kaczmarz": randomized_project_kaczmarz,
+}
+
+
 def orthogonalize_lowrank(M_bf16: torch.Tensor, k: int, p: int, h: int,
-                          coeffs: list) -> torch.Tensor:
+                          coeffs: list, projector: str = "gaussian") -> torch.Tensor:
     """Randomized low-rank orthogonalization:
-        randomized_project(M) -> (Q, B_small)
+        project(M) -> (Q, B_small)            [Halko Gaussian or Kaczmarz importance sketch]
         B_orth = orthogonalize(B_small, coeffs)
         lift: Q @ B_orth  (tall)  or  B_orth @ Q^T  (wide)
 
     The NS iteration runs on the small (k+p)-dim side, not the full m x n matrix.
     """
-    Q, B_small, is_tall = randomized_project(M_bf16, k, p, h)
+    project_fn = PROJECTOR_REGISTRY.get(projector)
+    if project_fn is None:
+        raise ValueError(f"Unknown projector {projector!r}. Options: {list(PROJECTOR_REGISTRY)}")
+    Q, B_small, is_tall = project_fn(M_bf16, k, p, h)
     # B_small is small on one side; no need to split baddbmm
     B_orth = orthogonalize(B_small, coeffs, split_baddbmm=False)
     if is_tall:
@@ -545,6 +634,7 @@ class ParamConfig:
     # Randomized-Muon research additions
     momentum_type: str = "nesterov"   # "nesterov" | "polyak"
     use_randomized: bool = False
+    projector: str = "gaussian"   # "gaussian" (Halko) | "kaczmarz" (importance-sampling)
     k: int = 0                    # absolute rank; computed in _build_param_cfg from rank_ratio
     oversampling: int = 10
     power_iter: int = 1
@@ -744,6 +834,12 @@ class NorMuonAndAdam:
             oversampling = self.normuon_defaults.get("oversampling", 10)
             power_iter = self.normuon_defaults.get("power_iter", 1)
 
+            projector = self.normuon_defaults.get("projector", "gaussian")
+            if projector not in PROJECTOR_REGISTRY:
+                raise ValueError(
+                    f"projector must be one of {list(PROJECTOR_REGISTRY)}, got {projector!r}"
+                )
+
             momentum_type = self.normuon_defaults.get("momentum_type", "nesterov")
             if momentum_type not in ("nesterov", "polyak"):
                 raise ValueError(f"momentum_type must be 'nesterov' or 'polyak', got {momentum_type!r}")
@@ -764,6 +860,7 @@ class NorMuonAndAdam:
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
                 use_randomized=use_randomized,
+                projector=projector,
                 k=k_abs,
                 oversampling=oversampling,
                 power_iter=power_iter,
@@ -1234,7 +1331,7 @@ class NorMuonAndAdam:
             v_chunk = orthogonalize_lowrank(
                 M_bf16,
                 k=p_cfg.k, p=p_cfg.oversampling, h=p_cfg.power_iter,
-                coeffs=p_cfg.coeffs,
+                coeffs=p_cfg.coeffs, projector=p_cfg.projector,
             )
         else:
             v_chunk = orthogonalize(
@@ -1431,6 +1528,24 @@ _disable_fa3 = os.environ.get("DISABLE_FA3", "0") == "1"
 if _device_cap[0] >= 9 and not _disable_fa3:
     try:
         flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        # FA3's fake/meta registration imports flash_attn_config by top-level
+        # name during torch.compile. The HF kernels loader can import the
+        # interface without adding the package dirs to sys.path, so add them
+        # explicitly and pre-alias the config module when needed.
+        _fa3_pkg_dir = Path(flash_attn_interface.__file__).resolve().parent
+        _fa3_build_dir = _fa3_pkg_dir.parent
+        for _fa3_path in (str(_fa3_build_dir), str(_fa3_pkg_dir)):
+            if _fa3_path not in sys.path:
+                sys.path.insert(0, _fa3_path)
+        try:
+            importlib.import_module("flash_attn_config")
+        except ModuleNotFoundError:
+            try:
+                sys.modules["flash_attn_config"] = importlib.import_module(
+                    f"{flash_attn_interface.__package__}.flash_attn_config"
+                )
+            except Exception:
+                pass
         _fa_varlen_func = flash_attn_interface.flash_attn_varlen_func
         _FA_BACKEND = "fa3"
     except Exception:
@@ -1619,7 +1734,8 @@ class GPT(nn.Module):
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        disable_fp8 = os.environ.get("DISABLE_FP8", "0").lower() in {"1", "true", "yes", "on"}
+        use_fp8 = not disable_fp8
         # Transposed weight storage for faster gradient accumulation
         self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
@@ -1983,6 +2099,7 @@ class Hyperparameters:
     solver:         str   = os.environ.get("SOLVER", "polar_express")
     ns_steps:       int   = int(os.environ.get("NS_STEPS", 5))
     use_randomized: bool  = os.environ.get("USE_RANDOMIZED", "0") == "1"
+    projector:      str   = os.environ.get("PROJECTOR", "gaussian")       # "gaussian" | "kaczmarz"
     rank_ratio:     float = float(os.environ.get("RANK_RATIO", 0.125))
     oversampling:   int   = int(os.environ.get("OVERSAMPLING", 10))
     power_iter:     int   = int(os.environ.get("POWER_ITER", 1))
@@ -2046,6 +2163,9 @@ def _build_cli_parser():
                    help="Absolute target rank k for randomized projection. 0 = fall back to rank_ratio semantics.")
     p.add_argument("--oversampling", type=int, default=None)
     p.add_argument("--power-iters", "--power_iters", type=int, default=None)
+    p.add_argument("--projector", type=str, default=None,
+                   choices=("gaussian", "kaczmarz"),
+                   help="Sketch type for randomized low-rank projection: gaussian (Halko) or kaczmarz (importance-sampling on column norms).")
     # Batch schedule knob: middle factor in batch_size = N * seq_len * reference_world_size (scales uniformly across stages)
     p.add_argument("--seq-len", "--seq_len", type=int, default=2048,
                    help="Middle factor of batch_size formula (uniformly scales total batch across all curriculum stages).")
@@ -2084,6 +2204,8 @@ def _merge_cli_into_args(args: Hyperparameters, cli_args: argparse.Namespace) ->
         args.oversampling = cli_args.oversampling
     if cli_args.power_iters is not None:
         args.power_iter = cli_args.power_iters
+    if cli_args.projector is not None:
+        args.projector = cli_args.projector
     if cli_args.sgd_lr is not None:
         args.sgd_lr = cli_args.sgd_lr
     if cli_args.adamw_lr is not None:
@@ -2137,6 +2259,7 @@ ARG_ABBREVIATIONS = {
     "rank":            "rk",
     "oversampling":    "ov",
     "power_iters":     "pi",
+    "projector":       "pj",
     "muon_lr":         "mlr",
     "muon_momentum":   "mmm",
     "muon_nesterov":   "mn",
@@ -2151,7 +2274,7 @@ MODE_FOLDER_ARGS = {
     "muon": [
         "muon_lr", "muon_momentum", "muon_nesterov",
         "inexact_solver", "orth_steps",
-        "randomized", "rank", "oversampling", "power_iters",
+        "randomized", "rank", "oversampling", "power_iters", "projector",
         "seq_len", "num_trials", "log_every",
     ],
     "sgd_nesterov": [
@@ -2385,6 +2508,7 @@ class TrainingManager():
             solver=args.solver,
             ns_steps=args.ns_steps,
             use_randomized=args.use_randomized,
+            projector=args.projector,
             rank_ratio=args.rank_ratio,
             rank_abs=args.rank,                  # 0 â†’ use rank_ratio; >0 â†’ absolute rank
             oversampling=args.oversampling,
@@ -2495,7 +2619,18 @@ class TrainingManager():
 
 
     def get_state(self):
-        return copy.deepcopy(self.optimizer.state_dict())
+        def to_cpu(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().clone()
+            if isinstance(obj, dict):
+                return {k: to_cpu(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [to_cpu(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(to_cpu(v) for v in obj)
+            return copy.deepcopy(obj)
+
+        return to_cpu(self.optimizer.state_dict())
 
     def sparse_index_update(self, step, bigram_indexes):
         if not _sparse_comms_active():
@@ -2626,7 +2761,10 @@ print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
+del initial_state["model"]
 del val_loader, train_loader
+gc.collect()
+torch.cuda.empty_cache()
 model.train()
 
 ########################################
@@ -2767,6 +2905,14 @@ for trial_id in range(args.num_trials):
         train_losses.append(step_train_loss)
         if use_wandb:
             wandb.log({"train_loss": step_train_loss, "step": step})
+        # Early-abort the trial if loss has diverged. Saves ~15 min/trial of
+        # wasted compute on bayes-sampled configs that blow up. Log a sentinel
+        # val_loss so wandb hyperband can rank this trial as "worst".
+        if not math.isfinite(step_train_loss):
+            print0(f"!! step:{step} train_loss diverged to {step_train_loss}; aborting trial", console=True)
+            if use_wandb:
+                wandb.log({"val_loss": float("inf"), "step": step})
+            break
 
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         train_times_ms.append(approx_training_time_ms)
