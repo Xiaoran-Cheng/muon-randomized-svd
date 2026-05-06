@@ -50,15 +50,6 @@ except ImportError:
 
 @torch.compile
 def quintic_ns_empirical(G, steps=3, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
@@ -155,16 +146,6 @@ def polar_express(G, steps= 3, eps = 1e-7):
 #############################################
 
 def randomized_project(M, rank=32, oversampling=2, power_iters=0):
-    """
-    Gaussian randomized subspace iteration.
-    Returns Q (m x ell, orthonormal) and B = Q^T M (ell x n).
-
-    Algorithm:
-        1. Draw Gaussian sketch Omega (n x ell)
-        2. Y = (MM^T)^h @ M @ Omega
-        3. Q = orth(Y)
-        4. B = Q^T @ M
-    """
     m, n = M.shape
     ell = rank + oversampling
 
