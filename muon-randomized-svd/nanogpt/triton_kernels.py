@@ -4,9 +4,6 @@ import triton.language as tl
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 except ImportError:
-    # Older Triton (A100 setups) lacks TMA descriptors. linear_relu_square requires
-    # it and is Hopper-only anyway; train_gpt.py swaps to an eager fallback on
-    # non-Hopper GPUs so this import failure doesn't crash smoke tests.
     TensorDescriptor = None
 
 # -----------------------------------------------------------------------------
@@ -554,9 +551,12 @@ def fused_softcapped_entropy_fwd_kernel(
     row_idx = tl.program_id(0).to(tl.int64)
     logits_row_ptr = logits_ptr + row_idx * stride_logits_n
 
-    max_val = -float('inf')
-    sum_exp = 0.0
+    max_val: tl.float32 = -float('inf')
+    sum_exp: tl.float32 = 0.0
 
+    A = A.to(tl.float32)
+    B = B.to(tl.float32)
+    C = C.to(tl.float32)
     inv_C = 1.0 / C
     B_div_C = B * inv_C
 
@@ -574,7 +574,7 @@ def fused_softcapped_entropy_fwd_kernel(
     lse = max_val + tl.log(sum_exp)
     tl.store(lse_ptr + row_idx, lse)
 
-    total_loss = 0.0
+    total_loss: tl.float32 = 0.0
     for k in range(n_predict):
         target_idx = row_idx + k
         if target_idx < n_rows:
@@ -606,13 +606,17 @@ def fused_softcapped_entropy_bwd_kernel(
     lse = tl.load(lse_ptr + row_idx)
     grad_loss = tl.load(grad_output_ptr + row_idx)
 
+    A = A.to(tl.float32)
+    B = B.to(tl.float32)
+    C = C.to(tl.float32)
+    grad_s = grad_s.to(tl.float32)
     inv_C = 1.0 / C
     B_div_C = B * inv_C
     inv_C_A = inv_C * A
     inv_grad_s = 1.0 / grad_s
 
     # Preload all targets and weights before the column loop
-    S_w = 0.0
+    S_w: tl.float32 = 0.0
     t0: tl.int32 = -1
     t1: tl.int32 = -1
     t2: tl.int32 = -1
@@ -830,13 +834,13 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=2
         )
 
-        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8)
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x_f8, w_f8)
         ctx.params = (A, B, C, x_s, w_s, grad_s)
         return losses
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8 = ctx.saved_tensors
+        logits, targets, mtp_weights, lse, x_f8, w_f8 = ctx.saved_tensors
         A, B, C, x_s, w_s, grad_s = ctx.params
         n_rows, n_cols = logits.shape
         n_predict = mtp_weights.shape[0]
@@ -855,6 +859,9 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             num_warps=4,
             N_PREDICT=n_predict,
         )
+        if hasattr(ctx, "maybe_clear_saved_tensors"):
+            ctx.maybe_clear_saved_tensors()
+        del logits, targets, mtp_weights, lse, grad_output
 
         x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
         w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
@@ -868,12 +875,15 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
             scale_b=w_scale,
             use_fast_accum=False,
         )
+        del w_f8, w_scale
 
         x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
         transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+        del x_f8
 
         grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
         transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+        del grad_input
 
         grad_w = torch._scaled_mm(
             x_f8_T,            # (768, n_rows) row-major
