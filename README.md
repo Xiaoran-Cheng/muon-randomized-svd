@@ -1,4 +1,4 @@
-# muon-randomized-svd
+# Muon with Nesterov Momentum: Heavy-Tailed Noise and (Randomized) Inexact Polar Decomposition
 
 Code for the paper *Muon with Nesterov Momentum: Heavy-Tailed Noise and (Randomized) Inexact Polar Decomposition*, which develops a convergence theory for Muon with Nesterov momentum and inexact polar decomposition in non-convex matrix optimization under heavy-tailed noise. Before each Newton–Schulz iteration, the momentum buffer is projected onto a low-rank sketch, so the orthogonalization runs on a rank-`s` compressed matrix and is then lifted back to the original space. We validate this scheme empirically on CIFAR-10 and NanoGPT.
 
