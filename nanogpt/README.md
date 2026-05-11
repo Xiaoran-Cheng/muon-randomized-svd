@@ -58,7 +58,7 @@ torchrun --standalone --nproc_per_node=4 train_gpt.py \
 | `--inexact-solver` | `cubic`, `quintic_theoretical`, `quintic_empirical`, `polar_express` |
 | `--orth-steps` | Newton–Schulz iterations `q` |
 | `--randomized` | Enable randomized projection before orthogonalization |
-| `--rank` / `--oversampling` / `--power-iters` | Sketch parameters `k`, `p`, `h` |
+| `--rank` / `--oversampling` / `--power-iters` | Sketch parameters `s`, `p`, `h` |
 | `--projector` | Sketch family: `gaussian` (Halko) or `kaczmarz` |
 | `--muon-nesterov` | `True` = Nesterov, `False` = Polyak |
 | `--seq-len` | Middle factor of total batch (uniformly scales batch across stages) |
